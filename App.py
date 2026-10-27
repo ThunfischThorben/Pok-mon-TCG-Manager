@@ -11,7 +11,7 @@ import streamlit as st
 
 
 # ==========================================
-# GRUNDEINSTELLUNGEN
+# EINSTELLUNGEN
 # ==========================================
 
 st.set_page_config(
@@ -27,23 +27,7 @@ DB_PATH = Path("pokemon_manager.db")
 # HILFSFUNKTIONEN
 # ==========================================
 
-def to_cents(value):
-    amount = Decimal(str(value if value is not None else 0))
-
-    if not amount.is_finite():
-        raise ValueError("Ungültiger Preis")
-
-    return int(
-        (amount * 100).quantize(
-            Decimal("1"),
-            rounding=ROUND_HALF_UP
-        )
-    )
-
-
-def format_euro(value_cents):
-    value = Decimal(value_cents) / 100
-
+def euro(value):
     return (
         f"{value:,.2f}"
         .replace(",", "X")
@@ -53,11 +37,25 @@ def format_euro(value_cents):
     )
 
 
-def calculate_offer(market_cents, percentage=80):
+def to_cents(value):
+    amount = Decimal(str(value))
+    return int(
+        (amount * 100).quantize(
+            Decimal("1"),
+            rounding=ROUND_HALF_UP
+        )
+    )
+
+
+def money(cents):
+    return euro(Decimal(cents) / 100)
+
+
+def percentage(cents, percent):
     return int(
         (
-            Decimal(market_cents)
-            * Decimal(percentage)
+            Decimal(cents)
+            * Decimal(percent)
             / 100
         ).quantize(
             Decimal("1"),
@@ -66,19 +64,14 @@ def calculate_offer(market_cents, percentage=80):
     )
 
 
-def get_connection():
-    connection = sqlite3.connect(
+def database():
+    db = sqlite3.connect(
         DB_PATH,
         timeout=30
     )
-
-    connection.row_factory = sqlite3.Row
-
-    connection.execute(
-        "PRAGMA foreign_keys = ON"
-    )
-
-    return connection
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA foreign_keys = ON")
+    return db
 
 
 # ==========================================
@@ -87,7 +80,7 @@ def get_connection():
 
 def initialize_database():
 
-    with get_connection() as db:
+    with database() as db:
 
         db.execute("""
             CREATE TABLE IF NOT EXISTS collections (
@@ -112,108 +105,16 @@ def initialize_database():
                 quantity INTEGER NOT NULL,
                 price_cents INTEGER NOT NULL,
                 image TEXT,
-
-                FOREIGN KEY (collection_id)
+                FOREIGN KEY(collection_id)
                     REFERENCES collections(id)
                     ON DELETE CASCADE
             )
         """)
 
 
-# ==========================================
-# JSON IMPORT
-# ==========================================
-
-def parse_json(uploaded_file):
-
-    try:
-        data = json.load(uploaded_file)
-
-    except (ValueError, UnicodeDecodeError):
-        raise ValueError(
-            "Die hochgeladene Datei enthält kein gültiges JSON."
-        )
-
-    if not isinstance(data, dict):
-        raise ValueError(
-            "Ungültiges JSON-Format."
-        )
-
-    items = data.get("items")
-
-    if not isinstance(items, list):
-        raise ValueError(
-            "Keine gültige Kartenliste gefunden."
-        )
-
-    cards = []
-
-    for index, item in enumerate(items, start=1):
-
-        if not isinstance(item, dict):
-            raise ValueError(
-                f"Ungültiger Karteneintrag: {index}"
-            )
-
-        try:
-            quantity = int(
-                item.get("quantity", 1)
-            )
-
-            price_cents = to_cents(
-                item.get("addedEur")
-            )
-
-            if quantity < 1 or price_cents < 0:
-                raise ValueError()
-
-        except (
-            ValueError,
-            TypeError,
-            ArithmeticError
-        ):
-            raise ValueError(
-                f"Ungültige Menge oder Preis bei Karte {index}."
-            )
-
-        cards.append({
-            "card_id": str(
-                item.get("id") or ""
-            ),
-            "name": str(
-                item.get("name") or "Unbekannt"
-            ),
-            "set_name": str(
-                item.get("setName") or ""
-            ),
-            "number": str(
-                item.get("number") or ""
-            ),
-            "language": str(
-                item.get("language") or ""
-            ),
-            "quantity": quantity,
-            "price_cents": price_cents,
-            "image": str(
-                item.get("image") or ""
-            )
-        })
-
-    if not cards:
-        raise ValueError(
-            "Die Sammlung enthält keine Karten."
-        )
-
-    return cards
-
-
-# ==========================================
-# SAMMLUNG SPEICHERN
-# ==========================================
-
 def save_collection(seller, cards):
 
-    with get_connection() as db:
+    with database() as db:
 
         cursor = db.execute("""
             INSERT INTO collections (
@@ -259,88 +160,63 @@ def save_collection(seller, cards):
     return collection_id
 
 
-# ==========================================
-# SAMMLUNGEN ABRUFEN
-# ==========================================
-
 def get_collections(status=None):
 
     query = """
         SELECT
             c.*,
-
             COALESCE(
                 SUM(k.quantity * k.price_cents),
                 0
             ) AS market_cents,
-
             COALESCE(
                 SUM(k.quantity),
                 0
             ) AS card_count
-
         FROM collections c
-
         LEFT JOIN cards k
             ON k.collection_id = c.id
     """
 
-    parameters = []
+    params = []
 
-    if status is not None:
-
-        query += """
-            WHERE c.status = ?
-        """
-
-        parameters.append(status)
+    if status:
+        query += " WHERE c.status = ?"
+        params.append(status)
 
     query += """
         GROUP BY c.id
         ORDER BY c.id DESC
     """
 
-    with get_connection() as db:
-
+    with database() as db:
         return db.execute(
             query,
-            parameters
+            params
         ).fetchall()
 
 
 def get_cards(collection_id):
 
-    with get_connection() as db:
-
+    with database() as db:
         return db.execute("""
             SELECT *
             FROM cards
             WHERE collection_id = ?
             ORDER BY id
-        """, (
-            collection_id,
-        )).fetchall()
+        """, (collection_id,)).fetchall()
 
 
-# ==========================================
-# KAUFVERWALTUNG
-# ==========================================
+def buy_collection(collection_id, purchase_cents):
 
-def purchase_collection(
-    collection_id,
-    purchase_cents
-):
-
-    with get_connection() as db:
+    with database() as db:
 
         db.execute("""
             UPDATE collections
-
             SET
                 status = 'gekauft',
                 purchase_cents = ?,
                 purchased_at = ?
-
             WHERE id = ?
               AND status = 'offen'
         """, (
@@ -352,225 +228,64 @@ def purchase_collection(
 
 def undo_purchase(collection_id):
 
-    with get_connection() as db:
+    with database() as db:
 
         db.execute("""
             UPDATE collections
-
             SET
                 status = 'offen',
                 purchase_cents = NULL,
                 purchased_at = NULL
-
             WHERE id = ?
               AND status = 'gekauft'
-        """, (
-            collection_id,
-        ))
+        """, (collection_id,))
 
 
 def delete_collection(collection_id):
 
-    with get_connection() as db:
+    with database() as db:
 
         db.execute("""
             DELETE FROM collections
-
             WHERE id = ?
               AND status = 'offen'
-        """, (
-            collection_id,
-        ))
+        """, (collection_id,))
 
 
 # ==========================================
-# KARTEN ANZEIGEN
+# JSON-IMPORT
 # ==========================================
 
-def display_cards(collection_id):
+def read_cardvalue_json(uploaded_file):
 
-    cards = get_cards(collection_id)
+    try:
+        data = json.load(uploaded_file)
 
-    for card in cards:
-
-        left, right = st.columns([1, 4])
-
-        with left:
-
-            if card["image"]:
-
-                st.image(
-                    card["image"],
-                    width=140
-                )
-
-        with right:
-
-            st.subheader(
-                card["name"]
-            )
-
-            st.write(
-                f"Set: {card['set_name']}"
-            )
-
-            st.write(
-                f"Kartennummer: {card['number']}"
-            )
-
-            st.write(
-                f"Sprache: {card['language']}"
-            )
-
-            st.write(
-                f"Menge: {card['quantity']}"
-            )
-
-            total_cents = (
-                card["quantity"]
-                * card["price_cents"]
-            )
-
-            st.write(
-                "Einzelpreis: "
-                f"**{format_euro(card['price_cents'])}**"
-            )
-
-            st.write(
-                "Gesamtwert: "
-                f"**{format_euro(total_cents)}**"
-            )
-
-            st.write(
-                "80-%-Ankaufswert: "
-                f"**{format_euro(calculate_offer(total_cents))}**"
-            )
-
-            search_text = quote(
-                f"{card['name']} "
-                f"{card['number']} "
-                f"{card['set_name']}"
-            )
-
-            cardmarket_url = (
-                "https://www.cardmarket.com/"
-                "en/Pokemon/Products/Search"
-                f"?searchString={search_text}"
-            )
-
-            st.link_button(
-                "🔗 Auf Cardmarket suchen",
-                cardmarket_url
-            )
-
-        st.divider()
-
-
-# ==========================================
-# EXCEL EXPORT
-# ==========================================
-
-def create_excel(collection_id, seller):
-
-    cards = get_cards(collection_id)
-
-    rows = []
-
-    for card in cards:
-
-        total_cents = (
-            card["quantity"]
-            * card["price_cents"]
+    except (ValueError, UnicodeDecodeError):
+        raise ValueError(
+            "Die Datei enthält kein gültiges JSON."
         )
 
-        rows.append({
-            "Verkäufer": seller,
-            "Karten-ID": card["card_id"],
-            "Kartenname": card["name"],
-            "Set": card["set_name"],
-            "Kartennummer": card["number"],
-            "Sprache": card["language"],
-            "Menge": card["quantity"],
-
-            "Einzelpreis (€)":
-                card["price_cents"] / 100,
-
-            "Gesamtwert (€)":
-                total_cents / 100,
-
-            "80% Ankauf (€)":
-                calculate_offer(total_cents) / 100,
-
-            "Bildlink": card["image"]
-        })
-
-    dataframe = pd.DataFrame(rows)
-
-    output = io.BytesIO()
-
-    with pd.ExcelWriter(
-        output,
-        engine="xlsxwriter"
-    ) as writer:
-
-        dataframe.to_excel(
-            writer,
-            sheet_name="Sammlung",
-            index=False
+    if not isinstance(data, dict):
+        raise ValueError(
+            "Ungültiges JSON-Format."
         )
 
-        worksheet = writer.sheets["Sammlung"]
+    items = data.get("items")
 
-        worksheet.freeze_panes(1, 0)
-
-        worksheet.set_column(
-            0, 0, 24
+    if not isinstance(items, list):
+        raise ValueError(
+            "Keine gültige Kartenliste gefunden."
         )
 
-        worksheet.set_column(
-            1, 1, 24
-        )
+    cards = []
 
-        worksheet.set_column(
-            2, 3, 30
-        )
+    for index, item in enumerate(items, start=1):
 
-        worksheet.set_column(
-            4, 6, 18
-        )
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"Ungültiger Karteneintrag: {index}"
+            )
 
-        worksheet.set_column(
-            7, 9, 22
-        )
-
-        worksheet.set_column(
-            10, 10, 70
-        )
-
-    return output.getvalue()
-
-
-def excel_button(collection):
-
-    collection_id = collection["id"]
-
-    excel_data = create_excel(
-        collection_id,
-        collection["seller"]
-    )
-
-    st.download_button(
-        "📥 Sammlung als Excel herunterladen",
-        data=excel_data,
-        file_name=f"sammlung_{collection_id}.xlsx",
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
-        key=f"excel_{collection_id}",
-        use_container_width=True
-    )
-
-
-# ==========================================
-# DATENBANK
+        try:
+           
