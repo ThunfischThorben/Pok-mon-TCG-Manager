@@ -2,1265 +2,408 @@ import io
 import json
 import re
 import sqlite3
-
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
-from urllib.parse import urlencode, urlparse, urlunparse
+from urllib.parse import quote, urlencode, urljoin, urlparse
 
 import pandas as pd
+import requests
 import streamlit as st
+from bs4 import BeautifulSoup
 
-
-# ============================================================
-# EINSTELLUNGEN
-# ============================================================
-
-st.set_page_config(
-    page_title="Pokémon TCG Manager",
-    page_icon="🃏",
-    layout="wide"
-)
-
+st.set_page_config(page_title="Pokémon TCG Manager", page_icon="🃏", layout="wide")
 DB_PATH = Path("pokemon_manager.sqlite3")
+BASE = "https://www.cardmarket.com/en/Pokemon"
+LANGUAGES = {"en": 1, "eng": 1, "de": 3, "ger": 3, "fr": 2, "es": 4, "it": 5, "zh": 6, "ja": 7, "jp": 7, "jpn": 7, "pt": 8, "ko": 10}
+LANGUAGE_NAMES = {"en": "Englisch", "de": "Deutsch", "fr": "Französisch", "es": "Spanisch", "it": "Italienisch", "ja": "Japanisch", "jp": "Japanisch", "pt": "Portugiesisch", "ko": "Koreanisch", "zh": "Chinesisch"}
+# Eine vom Nutzer bestätigte Zuordnung. Weitere werden automatisch gesucht.
+KNOWN_PRODUCTS = {"swsh12.5gg-GG44": "https://www.cardmarket.com/en/Pokemon/Products/Singles/Crown-Zenith/Mewtwo-VSTAR-CRZGG44"}
 
-DEFAULT_QUOTE = 80
-
-CARDMARKET_BASE = "https://www.cardmarket.com/en/Pokemon"
-
-# Cardmarket-Sprachcodes
-LANGUAGE_IDS = {
-    "en": 1,
-    "eng": 1,
-    "english": 1,
-    "englisch": 1,
-
-    "fr": 2,
-    "fra": 2,
-    "french": 2,
-    "französisch": 2,
-
-    "de": 3,
-    "ger": 3,
-    "german": 3,
-    "deutsch": 3,
-
-    "es": 4,
-    "spa": 4,
-    "spanish": 4,
-    "spanisch": 4,
-
-    "it": 5,
-    "ita": 5,
-    "italian": 5,
-    "italienisch": 5,
-
-    "zh": 6,
-    "chinese": 6,
-    "chinesisch": 6,
-
-    "ja": 7,
-    "jp": 7,
-    "jpn": 7,
-    "japanese": 7,
-    "japanisch": 7,
-
-    "pt": 8,
-    "portuguese": 8,
-    "portugiesisch": 8,
-
-    "ko": 10,
-    "kr": 10,
-    "korean": 10,
-    "koreanisch": 10
-}
-
-LANGUAGE_NAMES = {
-    "en": "Englisch",
-    "de": "Deutsch",
-    "fr": "Französisch",
-    "es": "Spanisch",
-    "it": "Italienisch",
-    "ja": "Japanisch",
-    "jp": "Japanisch",
-    "pt": "Portugiesisch",
-    "ko": "Koreanisch",
-    "zh": "Chinesisch"
-}
-
-# Verifizierte Cardmarket-Produktadressen.
-# Neue bestätigte Zuordnungen können ergänzt werden.
-#
-# Format:
-#   Cardvalue-ID: Cardmarket-Produktadresse
-#
-# Die Sprache wird später automatisch als Filter ergänzt.
-
-KNOWN_CARDMARKET_PRODUCTS = {
-    "swsh12.5gg-GG44": (
-        "https://www.cardmarket.com/en/Pokemon/"
-        "Products/Singles/Crown-Zenith/"
-        "Mewtwo-VSTAR-CRZGG44"
-    )
-}
-
-
-# ============================================================
-# ALLGEMEINE HILFSFUNKTIONEN
-# ============================================================
 
 def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def to_cents(value):
+def cents(value):
     try:
-        amount = Decimal(
-            str(value if value is not None else 0)
-        )
-
-        if not amount.is_finite() or amount < 0:
+        number = Decimal(str(0 if value is None else value))
+        if not number.is_finite() or number < 0:
             raise ValueError()
-
-        return int(
-            (amount * 100).quantize(
-                Decimal("1"),
-                rounding=ROUND_HALF_UP
-            )
-        )
-
+        return int((number * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
     except (ValueError, TypeError, ArithmeticError):
-        raise ValueError("Ungültiger Euro-Preis.")
+        raise ValueError("Ungültiger Preis in der JSON-Datei.")
 
 
-def euro(cents):
-    amount = cents / 100
-
-    return (
-        f"{amount:,.2f}"
-        .replace(",", "X")
-        .replace(".", ",")
-        .replace("X", ".")
-        + " €"
-    )
+def money(value):
+    return f"{value / 100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") + " €"
 
 
-def percent_value(cents, percent):
-    return int(
-        (
-            Decimal(cents)
-            * Decimal(percent)
-            / Decimal(100)
-        ).quantize(
-            Decimal("1"),
-            rounding=ROUND_HALF_UP
-        )
-    )
+def percentage(value, pct):
+    return int((Decimal(value) * Decimal(pct) / 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
-def language_id(language):
-    key = str(language or "").strip().lower()
-    return LANGUAGE_IDS.get(key)
+def card_language(card):
+    return str(card["language"] or "").lower().strip()
 
 
-def language_name(language):
-    key = str(language or "").strip().lower()
-
-    return LANGUAGE_NAMES.get(
-        key,
-        str(language or "Unbekannt")
-    )
+def language_name(card):
+    key = card_language(card)
+    return LANGUAGE_NAMES.get(key, key or "Unbekannt")
 
 
-def safe_filename(value):
-    text = re.sub(
-        r"[^a-zA-Z0-9_-]+",
-        "_",
-        str(value)
-    )
-
-    return text.strip("_")[:60] or "sammlung"
+def filters(card):
+    values = {"sellerCountry": "7", "minCondition": "2"}
+    code = LANGUAGES.get(card_language(card))
+    if code is not None:
+        values["language"] = str(code)
+    return values
 
 
-# ============================================================
-# CARDMARKET
-# ============================================================
-
-def validate_cardmarket_url(url):
-    """
-    Prüft, ob eine URL zu einer echten
-    Cardmarket-Pokémon-Einzelkarten-Produktseite gehört.
-    """
-
-    url = str(url or "").strip()
-
-    if not url:
-        return ""
-
+def valid_product_url(url):
     parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in ("www.cardmarket.com", "cardmarket.com"):
+        return None
+    if not re.fullmatch(r"/(?:en|de|fr|es|it)/Pokemon/Products/Singles/[^/]+/[^/]+/?", parsed.path):
+        return None
+    return "https://www.cardmarket.com" + parsed.path.rstrip("/")
 
-    if parsed.scheme != "https":
-        raise ValueError(
-            "Bitte einen HTTPS-Link verwenden."
+
+def search_url(card):
+    number = str(card["number"] or "").split("/")[0].strip()
+    query = " ".join(x for x in (card["name"], number, card["set_name"]) if x)
+    params = {"searchString": query, **filters(card)}
+    return BASE + "/Products/Search?" + urlencode(params)
+
+
+def normalized_words(value):
+    return set(re.findall(r"[a-z0-9]+", str(value).lower()))
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def find_product(card_id, name, set_name, number):
+    """Best-effort lookup. Cardmarket may block automated requests."""
+    if card_id in KNOWN_PRODUCTS:
+        return KNOWN_PRODUCTS[card_id]
+    needle = str(number or "").split("/")[0].strip().lower()
+    if not needle or not name:
+        return None
+    query = " ".join(x for x in (name, needle, set_name) if x)
+    try:
+        response = requests.get(
+            BASE + "/Products/Search",
+            params={"searchString": query},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; PokemonCollectionManager/1.0)"},
+            timeout=6,
         )
-
-    if parsed.hostname not in (
-        "cardmarket.com",
-        "www.cardmarket.com"
-    ):
-        raise ValueError(
-            "Bitte einen Link von Cardmarket verwenden."
-        )
-
-    pattern = (
-        r"^/(?:en|de|fr|es|it)/Pokemon/"
-        r"Products/Singles/[^/]+/[^/]+/?$"
-    )
-
-    if not re.match(pattern, parsed.path):
-        raise ValueError(
-            "Bitte die direkte Cardmarket-Produktseite "
-            "einer Pokémon-Einzelkarte einfügen."
-        )
-
-    # Vorhandene Filter entfernen.
-    # Sie werden anhand der Karte neu erzeugt.
-    return urlunparse((
-        "https",
-        "www.cardmarket.com",
-        parsed.path,
-        "",
-        "",
-        ""
-    ))
-
-
-def cardmarket_product_url(card):
-    """
-    Liefert eine bekannte exakte Produktadresse.
-
-    Priorität:
-    1. Individuell gespeicherte Produktadresse
-    2. Bekannte Zuordnung über Cardvalue-Karten-ID
-    """
-
-    saved_url = str(
-        card["cardmarket_url"] or ""
-    ).strip()
-
-    if saved_url:
-        try:
-            return validate_cardmarket_url(saved_url)
-        except ValueError:
-            pass
-
-    card_id = str(
-        card["card_id"] or ""
-    ).strip()
-
-    known_url = KNOWN_CARDMARKET_PRODUCTS.get(card_id)
-
-    if known_url:
-        return known_url
-
-    return None
-
-
-def cardmarket_filtered_link(card):
-    """
-    Direkter Cardmarket-Produktlink.
-
-    Filter:
-    sellerCountry=7  -> Deutschland
-    minCondition=2   -> mindestens Near Mint
-    language=...     -> Sprache der Karte
-    """
-
-    product_url = cardmarket_product_url(card)
-
-    if not product_url:
+        if response.status_code != 200:
+            return None
+        soup = BeautifulSoup(response.text, "html.parser")
+        wanted_name = normalized_words(name)
+        candidates = []
+        for anchor in soup.select('a[href*="/Pokemon/Products/Singles/"]'):
+            raw = urljoin(BASE, anchor.get("href", ""))
+            url = valid_product_url(raw)
+            if not url:
+                continue
+            slug = urlparse(url).path.rsplit("/", 1)[-1].lower()
+            if not wanted_name.issubset(normalized_words(slug)):
+                continue
+            # A numeric collector number must be visible as a standalone number
+            # or after an expansion prefix (e.g. CRZGG44).
+            if not re.search(r"(?<!\d)" + re.escape(needle) + r"(?!\d)", slug):
+                continue
+            set_slug = urlparse(url).path.split("/")[-2]
+            set_match = len(normalized_words(set_name) & normalized_words(set_slug))
+            candidates.append((set_match, url))
+        candidates = list(set(candidates))
+        if not candidates:
+            return None
+        candidates.sort(reverse=True)
+        # Avoid choosing among ambiguous products.
+        if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+            return None
+        return candidates[0][1]
+    except requests.RequestException:
         return None
 
-    lang = language_id(card["language"])
 
-    parameters = {
-        "sellerCountry": "7",
-        "minCondition": "2"
-    }
-
-    if lang is not None:
-        parameters["language"] = str(lang)
-
-    return (
-        product_url
-        + "?"
-        + urlencode(parameters)
-    )
-
-
-def cardmarket_search_link(card):
-    """
-    Direkte Cardmarket-Suche für Karten,
-    deren exakte Produktseite noch nicht
-    bekannt ist.
-    """
-
-    name = str(card["name"] or "").strip()
-    number = str(card["number"] or "").strip()
-    set_name = str(card["set_name"] or "").strip()
-
-    number = number.split("/")[0].strip()
-
-    search_text = " ".join(
-        part
-        for part in (
-            name,
-            number,
-            set_name
-        )
-        if part
-    )
-
-    return (
-        CARDMARKET_BASE
-        + "/Products/Search?"
-        + urlencode({
-            "searchString": search_text
-        })
-    )
+def product_link(card):
+    url = find_product(str(card["card_id"] or ""), str(card["name"] or ""), str(card["set_name"] or ""), str(card["number"] or ""))
+    if not url:
+        return None
+    return url + "?" + urlencode(filters(card))
 
 
 def cardmarket_link(card):
-    return (
-        cardmarket_filtered_link(card)
-        or cardmarket_search_link(card)
-    )
+    return product_link(card) or search_url(card)
 
 
-# ============================================================
-# DATENBANK
-# ============================================================
-
-def get_db():
-    conn = sqlite3.connect(
-        DB_PATH,
-        timeout=30
-    )
-
+def db():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
-
-    conn.execute(
-        "PRAGMA foreign_keys = ON"
-    )
-
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
 def init_db():
-    with get_db() as conn:
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS collections (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                seller TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'offen',
-                quote_percent INTEGER NOT NULL DEFAULT 80,
-                purchase_cents INTEGER,
-                purchased_at TEXT
-            )
-        """)
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS cards (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                collection_id INTEGER NOT NULL,
-                card_id TEXT,
-                name TEXT NOT NULL,
-                set_name TEXT,
-                number TEXT,
-                language TEXT,
-                quantity INTEGER NOT NULL,
-                price_cents INTEGER NOT NULL,
-                image TEXT,
-                card_path TEXT,
-                cardmarket_url TEXT DEFAULT '',
-                FOREIGN KEY(collection_id)
-                    REFERENCES collections(id)
-                    ON DELETE CASCADE
-            )
-        """)
-
-        # Bestehende Datenbank erweitern,
-        # ohne Sammlungen zu löschen.
-
-        columns = [
-            row["name"]
-            for row in conn.execute(
-                "PRAGMA table_info(cards)"
-            ).fetchall()
-        ]
-
-        if "cardmarket_url" not in columns:
-            conn.execute("""
-                ALTER TABLE cards
-                ADD COLUMN cardmarket_url TEXT DEFAULT ''
-            """)
+    with db() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS collections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            seller TEXT NOT NULL, created_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'offen',
+            quote_percent INTEGER NOT NULL DEFAULT 80,
+            purchase_cents INTEGER, purchased_at TEXT
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS cards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            collection_id INTEGER NOT NULL,
+            card_id TEXT, name TEXT NOT NULL, set_name TEXT,
+            number TEXT, language TEXT, quantity INTEGER NOT NULL,
+            price_cents INTEGER NOT NULL, image TEXT, card_path TEXT,
+            FOREIGN KEY(collection_id) REFERENCES collections(id) ON DELETE CASCADE
+        )""")
 
 
-# ============================================================
-# JSON IMPORT
-# ============================================================
-
-def parse_json(uploaded_file):
+def parse_json(file):
     try:
-        data = json.load(uploaded_file)
-
+        data = json.load(file)
     except (ValueError, UnicodeDecodeError):
-        raise ValueError(
-            "Die Datei ist kein gültiges JSON."
-        )
-
-    if not isinstance(data, dict):
-        raise ValueError(
-            "Ungültiges JSON-Format."
-        )
-
-    items = data.get("items")
-
+        raise ValueError("Keine gültige JSON-Datei.")
+    items = data.get("items") if isinstance(data, dict) else None
     if not isinstance(items, list) or not items:
-        raise ValueError(
-            "Die JSON-Datei enthält keine Karten."
-        )
-
+        raise ValueError("Die Datei enthält keine Karten unter 'items'.")
     cards = []
-
-    for index, item in enumerate(items, start=1):
-
+    for i, item in enumerate(items, 1):
         if not isinstance(item, dict):
-            raise ValueError(
-                f"Ungültiger Eintrag bei Karte {index}."
-            )
-
+            raise ValueError(f"Ungültiger Eintrag {i}.")
         try:
-            quantity = int(
-                item.get("quantity", 1)
-            )
-
+            quantity = int(item.get("quantity", 1))
             if quantity < 1:
                 raise ValueError()
-
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"Ungültige Stückzahl bei Karte {index}."
-            )
-
-        raw_url = str(
-            item.get("cardmarketUrl")
-            or item.get("cardmarket_url")
-            or ""
-        ).strip()
-
-        if raw_url:
-            try:
-                raw_url = validate_cardmarket_url(raw_url)
-            except ValueError:
-                raw_url = ""
-
+        except (ValueError, TypeError):
+            raise ValueError(f"Ungültige Menge bei Karte {i}.")
         cards.append({
-            "card_id": str(
-                item.get("id") or ""
-            ),
-            "name": str(
-                item.get("name") or "Unbekannt"
-            ),
-            "set_name": str(
-                item.get("setName") or ""
-            ),
-            "number": str(
-                item.get("number") or ""
-            ),
-            "language": str(
-                item.get("language") or ""
-            ),
+            "card_id": str(item.get("id") or ""),
+            "name": str(item.get("name") or "Unbekannt"),
+            "set_name": str(item.get("setName") or ""),
+            "number": str(item.get("number") or ""),
+            "language": str(item.get("language") or ""),
             "quantity": quantity,
-            "price_cents": to_cents(
-                item.get("addedEur")
-            ),
-            "image": str(
-                item.get("image") or ""
-            ),
-            "card_path": str(
-                item.get("path") or ""
-            ),
-            "cardmarket_url": raw_url
+            "price_cents": cents(item.get("addedEur")),
+            "image": str(item.get("image") or ""),
+            "card_path": str(item.get("path") or ""),
         })
-
     return cards
 
 
-# ============================================================
-# SAMMLUNGEN SPEICHERN
-# ============================================================
-
-def save_collection(seller, quote_percent, cards):
-    with get_db() as conn:
-
-        cursor = conn.execute("""
-            INSERT INTO collections (
-                seller,
-                created_at,
-                status,
-                quote_percent
-            )
-            VALUES (?, ?, 'offen', ?)
-        """, (
-            seller,
-            now(),
-            quote_percent
-        ))
-
+def save_collection(seller, pct, cards):
+    with db() as conn:
+        cursor = conn.execute(
+            "INSERT INTO collections (seller,created_at,status,quote_percent) VALUES (?,?,'offen',?)",
+            (seller, now(), pct),
+        )
         collection_id = cursor.lastrowid
-
         for card in cards:
-            conn.execute("""
-                INSERT INTO cards (
-                    collection_id,
-                    card_id,
-                    name,
-                    set_name,
-                    number,
-                    language,
-                    quantity,
-                    price_cents,
-                    image,
-                    card_path,
-                    cardmarket_url
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                collection_id,
-                card["card_id"],
-                card["name"],
-                card["set_name"],
-                card["number"],
-                card["language"],
-                card["quantity"],
-                card["price_cents"],
-                card["image"],
-                card["card_path"],
-                card["cardmarket_url"]
+            conn.execute("""INSERT INTO cards
+                (collection_id,card_id,name,set_name,number,language,quantity,price_cents,image,card_path)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""", (
+                collection_id, card["card_id"], card["name"], card["set_name"],
+                card["number"], card["language"], card["quantity"],
+                card["price_cents"], card["image"], card["card_path"],
             ))
-
     return collection_id
 
 
 def get_collections():
-    with get_db() as conn:
-
-        return conn.execute("""
-            SELECT
-                c.*,
-
-                COALESCE(
-                    SUM(k.quantity * k.price_cents),
-                    0
-                ) AS market_cents,
-
-                COALESCE(
-                    SUM(k.quantity),
-                    0
-                ) AS card_count
-
-            FROM collections c
-
-            LEFT JOIN cards k
-                ON k.collection_id = c.id
-
-            GROUP BY c.id
-
-            ORDER BY c.id DESC
-        """).fetchall()
+    with db() as conn:
+        return conn.execute("""SELECT c.*,
+            COALESCE(SUM(k.quantity*k.price_cents),0) AS market_cents,
+            COALESCE(SUM(k.quantity),0) AS card_count
+            FROM collections c LEFT JOIN cards k ON k.collection_id=c.id
+            GROUP BY c.id ORDER BY c.id DESC""").fetchall()
 
 
 def get_cards(collection_id):
-    with get_db() as conn:
-
-        return conn.execute("""
-            SELECT *
-            FROM cards
-            WHERE collection_id = ?
-            ORDER BY id
-        """, (
-            collection_id,
-        )).fetchall()
+    with db() as conn:
+        return conn.execute("SELECT * FROM cards WHERE collection_id=? ORDER BY id", (collection_id,)).fetchall()
 
 
-def save_cardmarket_url(
-    card_id,
-    collection_id,
-    url
-):
-    normalized = (
-        validate_cardmarket_url(url)
-        if str(url).strip()
-        else ""
-    )
-
-    with get_db() as conn:
-        conn.execute("""
-            UPDATE cards
-            SET cardmarket_url = ?
-            WHERE id = ?
-              AND collection_id = ?
-        """, (
-            normalized,
-            card_id,
-            collection_id
-        ))
-
-
-# ============================================================
-# KAUFVERWALTUNG
-# ============================================================
-
-def mark_purchased(collection_id, purchase_cents):
-    with get_db() as conn:
-        conn.execute("""
-            UPDATE collections
-            SET
-                status = 'gekauft',
-                purchase_cents = ?,
-                purchased_at = ?
-            WHERE id = ?
-              AND status = 'offen'
-        """, (
-            purchase_cents,
-            now(),
-            collection_id
-        ))
+def mark_purchased(collection_id, value):
+    with db() as conn:
+        conn.execute("""UPDATE collections SET status='gekauft',purchase_cents=?,purchased_at=?
+            WHERE id=? AND status='offen'""", (value, now(), collection_id))
 
 
 def undo_purchase(collection_id):
-    with get_db() as conn:
-        conn.execute("""
-            UPDATE collections
-            SET
-                status = 'offen',
-                purchase_cents = NULL,
-                purchased_at = NULL
-            WHERE id = ?
-              AND status = 'gekauft'
-        """, (
-            collection_id,
-        ))
+    with db() as conn:
+        conn.execute("""UPDATE collections SET status='offen',purchase_cents=NULL,purchased_at=NULL
+            WHERE id=? AND status='gekauft'""", (collection_id,))
 
 
 def delete_collection(collection_id):
-    with get_db() as conn:
-        conn.execute("""
-            DELETE FROM collections
-            WHERE id = ?
-              AND status = 'offen'
-        """, (
-            collection_id,
-        ))
+    with db() as conn:
+        conn.execute("DELETE FROM collections WHERE id=? AND status='offen'", (collection_id,))
 
-
-# ============================================================
-# EXCEL EXPORT
-# ============================================================
 
 def create_excel(collection, cards):
     rows = []
-
     for card in cards:
-
-        total = (
-            card["price_cents"]
-            * card["quantity"]
-        )
-
-        offer = percent_value(
-            total,
-            collection["quote_percent"]
-        )
-
+        total = card["quantity"] * card["price_cents"]
         rows.append({
             "Verkäufer": collection["seller"],
             "Karten-ID": card["card_id"],
             "Kartenname": card["name"],
             "Set": card["set_name"],
             "Kartennummer": card["number"],
-            "Sprache": language_name(
-                card["language"]
-            ),
+            "Sprache": language_name(card),
             "Zustand (Annahme)": "Near Mint",
             "Verkäuferland": "Deutschland",
             "Menge": card["quantity"],
-            "Cardvalue Einzelpreis (€)":
-                card["price_cents"] / 100,
+            "Cardvalue Einzelpreis (€)": card["price_cents"] / 100,
             "Gesamtwert (€)": total / 100,
-            "Ankaufsquote (%)":
-                collection["quote_percent"],
-            "Ankaufswert (€)": offer / 100,
+            "Ankaufsquote (%)": collection["quote_percent"],
+            "Ankaufswert (€)": percentage(total, collection["quote_percent"]) / 100,
             "Bildlink": card["image"],
             "Cardmarket Link": cardmarket_link(card),
-            "Direkte Produktseite": (
-                "Ja"
-                if cardmarket_filtered_link(card)
-                else "Nein"
-            )
+            "Direkte Produktseite": "Ja" if product_link(card) else "Nein – Suche",
         })
-
-    df = pd.DataFrame(rows)
-
     output = io.BytesIO()
-
-    with pd.ExcelWriter(
-        output,
-        engine="xlsxwriter"
-    ) as writer:
-
-        df.to_excel(
-            writer,
-            sheet_name="Sammlung",
-            index=False
-        )
-
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        pd.DataFrame(rows).to_excel(writer, sheet_name="Sammlung", index=False)
         sheet = writer.sheets["Sammlung"]
-
         sheet.freeze_panes(1, 0)
-
-        sheet.set_column("A:A", 22)
-        sheet.set_column("B:B", 22)
-        sheet.set_column("C:D", 28)
-        sheet.set_column("E:I", 20)
-        sheet.set_column("J:M", 23)
+        sheet.set_column("A:B", 23)
+        sheet.set_column("C:D", 30)
+        sheet.set_column("E:M", 20)
         sheet.set_column("N:O", 65)
-        sheet.set_column("P:P", 24)
-
-        money_format = writer.book.add_format({
-            "num_format": '#,##0.00 "€"'
-        })
-
-        for column in ("J", "K", "M"):
-            sheet.set_column(
-                f"{column}:{column}",
-                22,
-                money_format
-            )
-
+        sheet.set_column("P:P", 25)
     return output.getvalue()
 
 
-# ============================================================
-# APP STARTEN
-# ============================================================
-
 init_db()
-
 st.title("🃏 Pokémon TCG Manager")
-
-st.write(
-    "Dein persönlicher Pokémon-Ankaufsmanager"
-)
-
+st.write("Dein persönlicher Pokémon-Ankaufsmanager")
 st.divider()
 
 tab_dashboard, tab_storage, tab_import = st.tabs([
-    "📊 Dashboard",
-    "📦 Sammlungen",
-    "➕ Neue Sammlung"
+    "📊 Dashboard", "📦 Sammlungen", "➕ Neue Sammlung"
 ])
 
-
-# ============================================================
-# DASHBOARD
-# ============================================================
-
 with tab_dashboard:
-
     st.header("📊 Dashboard")
-
-    all_collections = get_collections()
-
-    purchased = [
-        collection
-        for collection in all_collections
-        if collection["status"] == "gekauft"
-    ]
-
-    invested = sum(
-        collection["purchase_cents"] or 0
-        for collection in purchased
-    )
-
-    market_value = sum(
-        collection["market_cents"]
-        for collection in purchased
-    )
-
-    profit = market_value - invested
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.metric(
-            "Investiertes Kapital",
-            euro(invested)
-        )
-
-    with col2:
-        st.metric(
-            "Warenwert",
-            euro(market_value)
-        )
-
-    with col3:
-        st.metric(
-            "Rechnerische Differenz",
-            euro(profit)
-        )
-
-    st.caption(
-        "Es werden nur gekaufte Sammlungen "
-        "berücksichtigt. Der Warenwert basiert "
-        "auf den importierten Cardvalue.ai-Preisen. "
-        "Gebühren und Versand sind nicht enthalten."
-    )
-
+    purchased = [c for c in get_collections() if c["status"] == "gekauft"]
+    invested = sum(c["purchase_cents"] or 0 for c in purchased)
+    market = sum(c["market_cents"] for c in purchased)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Investiertes Kapital", money(invested))
+    c2.metric("Warenwert", money(market))
+    c3.metric("Rechnerische Differenz", money(market - invested))
+    st.caption("Nur gekaufte Sammlungen. Warenwerte basieren auf Cardvalue.ai-Importpreisen, nicht auf Live-Cardmarket-Preisen. Gebühren und Versand sind nicht enthalten.")
     st.divider()
-
     st.subheader("📦 Gekaufte Sammlungen")
-
     if not purchased:
-        st.info(
-            "Noch keine Sammlung als gekauft markiert."
-        )
-
-    else:
-        for collection in purchased:
-
-            with st.expander(
-                f'✅ {collection["seller"]} – '
-                f'{euro(collection["market_cents"])}'
-            ):
-
-                st.write(
-                    "Karten:",
-                    collection["card_count"]
-                )
-
-                st.write(
-                    "Kaufpreis:",
-                    euro(
-                        collection["purchase_cents"] or 0
-                    )
-                )
-
-                st.write(
-                    "Warenwert:",
-                    euro(collection["market_cents"])
-                )
-
-                difference = (
-                    collection["market_cents"]
-                    - (collection["purchase_cents"] or 0)
-                )
-
-                st.write(
-                    "Rechnerische Differenz:",
-                    euro(difference)
-                )
-
-
-# ============================================================
-# SAMMLUNGEN
-# ============================================================
+        st.info("Noch keine Sammlung als gekauft markiert.")
+    for collection in purchased:
+        with st.expander(f'✅ {collection["seller"]} – {money(collection["market_cents"])}'):
+            st.write("Karten:", collection["card_count"])
+            st.write("Kaufpreis:", money(collection["purchase_cents"] or 0))
+            st.write("Warenwert:", money(collection["market_cents"]))
+            st.write("Rechnerische Differenz:", money(collection["market_cents"] - (collection["purchase_cents"] or 0)))
 
 with tab_storage:
-
     st.header("📦 Gespeicherte Sammlungen")
-
-    all_collections = get_collections()
-
-    if not all_collections:
-        st.info(
-            "Noch keine Sammlungen gespeichert."
-        )
-
-    for collection in all_collections:
-
-        collection_id = collection["id"]
-        seller = collection["seller"]
+    collections = get_collections()
+    if not collections:
+        st.info("Noch keine Sammlungen gespeichert.")
+    for collection in collections:
+        cid = collection["id"]
         market = collection["market_cents"]
-        quote_percent = collection["quote_percent"]
-
-        suggested = percent_value(
-            market,
-            quote_percent
-        )
-
+        suggested = percentage(market, collection["quote_percent"])
         status = collection["status"]
-
-        status_text = (
-            "✅ Gekauft"
-            if status == "gekauft"
-            else "🕒 Offen"
-        )
-
-        with st.expander(
-            f"{status_text} | {seller} | {euro(market)}"
-        ):
-
-            st.write(
-                f"**Verkäufer:** {seller}"
-            )
-
-            st.write(
-                f'**Karten:** {collection["card_count"]}'
-            )
-
-            st.write(
-                f"**Sammlungswert:** {euro(market)}"
-            )
-
-            st.write(
-                f"**Ankaufsquote:** {quote_percent} %"
-            )
-
-            st.write(
-                f"**Empfohlener Ankauf:** "
-                f"{euro(suggested)}"
-            )
-
-            cards = get_cards(collection_id)
-
+        status_text = "✅ Gekauft" if status == "gekauft" else "🕒 Offen"
+        with st.expander(f'{status_text} | {collection["seller"]} | {money(market)}'):
+            st.write("**Verkäufer:**", collection["seller"])
+            st.write("**Karten:**", collection["card_count"])
+            st.write("**Sammlungswert:**", money(market))
+            st.write("**Ankaufsquote:**", f'{collection["quote_percent"]} %')
+            st.write("**Empfohlener Ankauf:**", money(suggested))
             st.divider()
-
             st.subheader("🃏 Karten")
-
+            cards = get_cards(cid)
             for card in cards:
-
                 left, right = st.columns([1, 4])
-
                 with left:
                     if card["image"]:
-                        st.image(
-                            card["image"],
-                            width=120
-                        )
-
+                        try:
+                            st.image(card["image"], width=120)
+                        except Exception:
+                            st.caption("Bild nicht verfügbar")
                 with right:
-
-                    st.markdown(
-                        f'**{card["name"]}**'
-                    )
-
-                    st.write(
-                        f'{card["set_name"]} | '
-                        f'{card["number"]}'
-                    )
-
-                    st.write(
-                        "Sprache:",
-                        language_name(
-                            card["language"]
-                        )
-                    )
-
-                    st.write(
-                        "Menge:",
-                        card["quantity"]
-                    )
-
-                    st.write(
-                        "Einzelpreis:",
-                        euro(card["price_cents"])
-                    )
-
-                    exact_link = cardmarket_filtered_link(
-                        card
-                    )
-
-                    if exact_link:
-
-                        st.link_button(
-                            "🔗 Cardmarket – passende Angebote",
-                            exact_link
-                        )
-
-                        st.caption(
-                            "Kartensprache automatisch · "
-                            "Verkäufer Deutschland · "
-                            "mindestens Near Mint"
-                        )
-
+                    st.markdown(f'**{card["name"]}**')
+                    st.write(f'{card["set_name"]} | {card["number"]}')
+                    st.write(f'Sprache: {language_name(card)} | Menge: {card["quantity"]}')
+                    st.write("Einzelpreis:", money(card["price_cents"]))
+                    direct = product_link(card)
+                    if direct:
+                        st.link_button("🔗 Cardmarket – passende Angebote", direct)
+                        st.caption("Produktseite · Sprache aus JSON · Deutschland · mindestens Near Mint")
                     else:
-
-                        st.link_button(
-                            "🔎 Karte auf Cardmarket suchen",
-                            cardmarket_search_link(card)
-                        )
-
-                        st.caption(
-                            "Für diese Karte ist noch keine "
-                            "eindeutige Cardmarket-Produktseite "
-                            "hinterlegt."
-                        )
-
-                    with st.popover(
-                        "⚙️ Cardmarket-Produkt zuordnen"
-                    ):
-
-                        st.write(
-                            "Hier kannst du die exakte "
-                            "Cardmarket-Produktadresse "
-                            "einmalig speichern."
-                        )
-
-                        saved_url = str(
-                            card["cardmarket_url"] or ""
-                        )
-
-                        url_input = st.text_input(
-                            "Cardmarket-Produktlink",
-                            value=saved_url,
-                            key=(
-                                f"cm_url_{collection_id}_"
-                                f"{card['id']}"
-                            ),
-                            placeholder=(
-                                "https://www.cardmarket.com/"
-                                "en/Pokemon/Products/Singles/..."
-                            )
-                        )
-
-                        if st.button(
-                            "Produktlink speichern",
-                            key=(
-                                f"cm_save_{collection_id}_"
-                                f"{card['id']}"
-                            )
-                        ):
-
-                            try:
-
-                                save_cardmarket_url(
-                                    card["id"],
-                                    collection_id,
-                                    url_input
-                                )
-
-                                st.rerun()
-
-                            except ValueError as error:
-                                st.error(str(error))
-
+                        st.link_button("🔎 Auf Cardmarket suchen", search_url(card))
+                        st.caption("Produktseite nicht eindeutig ermittelbar. Cardmarket-Suche mit Filterparametern; deren Anwendung auf Suchergebnisse kann abweichen.")
                 st.divider()
-
-            excel = create_excel(
-                collection,
-                cards
-            )
-
+            excel = create_excel(collection, cards)
             st.download_button(
-                "📥 Excel herunterladen",
-                data=excel,
-                file_name=(
-                    f"sammlung_{collection_id}_"
-                    f"{safe_filename(seller)}.xlsx"
-                ),
-                mime=(
-                    "application/vnd.openxmlformats-"
-                    "officedocument.spreadsheetml.sheet"
-                ),
-                key=f"excel_{collection_id}"
+                "📥 Excel herunterladen", data=excel,
+                file_name=f"sammlung_{cid}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"excel_{cid}",
             )
-
             st.divider()
-
             if status == "offen":
-
                 purchase_eur = st.number_input(
-                    "Tatsächlicher Kaufpreis (€)",
-                    min_value=0.0,
-                    value=suggested / 100,
-                    step=1.0,
-                    key=f"purchase_{collection_id}"
+                    "Tatsächlicher Kaufpreis (€)", min_value=0.0,
+                    value=suggested / 100, step=1.0, key=f"purchase_{cid}",
                 )
-
-                if st.button(
-                    "✅ Als gekauft markieren",
-                    key=f"buy_{collection_id}",
-                    type="primary"
-                ):
-
-                    mark_purchased(
-                        collection_id,
-                        to_cents(purchase_eur)
-                    )
-
+                if st.button("✅ Als gekauft markieren", key=f"buy_{cid}", type="primary"):
+                    mark_purchased(cid, cents(purchase_eur))
                     st.rerun()
-
-                with st.popover(
-                    "🗑️ Sammlung löschen"
-                ):
-
-                    st.warning(
-                        "Die Sammlung wird dauerhaft gelöscht."
-                    )
-
-                    if st.button(
-                        "Löschen bestätigen",
-                        key=f"delete_{collection_id}"
-                    ):
-
-                        delete_collection(
-                            collection_id
-                        )
-
+                with st.popover("🗑️ Sammlung löschen"):
+                    st.warning("Diese Sammlung wird dauerhaft gelöscht.")
+                    if st.button("Löschen bestätigen", key=f"delete_{cid}"):
+                        delete_collection(cid)
                         st.rerun()
-
             else:
-
-                st.success(
-                    "Diese Sammlung ist gekauft "
-                    "und im Dashboard enthalten."
-                )
-
-                st.write(
-                    "Tatsächlicher Kaufpreis:",
-                    euro(
-                        collection["purchase_cents"] or 0
-                    )
-                )
-
-                if st.button(
-                    "↩️ Kauf rückgängig machen",
-                    key=f"undo_{collection_id}"
-                ):
-
-                    undo_purchase(collection_id)
-
+                st.success("Diese Sammlung ist gekauft und im Dashboard enthalten.")
+                st.write("Tatsächlicher Kaufpreis:", money(collection["purchase_cents"] or 0))
+                if st.button("↩️ Kauf rückgängig machen", key=f"undo_{cid}"):
+                    undo_purchase(cid)
                     st.rerun()
-
-
-# ============================================================
-# NEUE SAMMLUNG
-# ============================================================
 
 with tab_import:
-
     st.header("➕ Neue Sammlung anlegen")
-
-    st.write(
-        "Lade deine Cardvalue.ai-JSON-Datei hoch. "
-        "Kartensprache, Kartennummer, Set, Bilder "
-        "und Preise werden automatisch übernommen."
-    )
-
+    st.write("Lade eine Cardvalue.ai-JSON-Datei hoch. Kartensprache, Kartennummer, Set, Bilder und Preise werden automatisch übernommen.")
     with st.form("import_form"):
-
-        seller = st.text_input(
-            "Name des Verkäufers / der Sammlung",
-            placeholder="z. B. Max Mustermann"
-        )
-
-        uploaded = st.file_uploader(
-            "Cardvalue.ai JSON-Datei",
-            type=["json"]
-        )
-
-        quote_percent = st.slider(
-            "Ankaufsquote (%)",
-            min_value=0,
-            max_value=100,
-            value=DEFAULT_QUOTE
-        )
-
-        submitted = st.form_submit_button(
-            "📦 Sammlung speichern",
-            type="primary",
-            use_container_width=True
-        )
-
+        seller = st.text_input("Name des Verkäufers / der Sammlung")
+        uploaded = st.file_uploader("Cardvalue.ai JSON-Datei", type=["json"])
+        quote_percent = st.slider("Ankaufsquote (%)", 0, 100, 80)
+        submitted = st.form_submit_button("📦 Sammlung speichern", type="primary", use_container_width=True)
     if submitted:
-
         if not seller.strip():
-
-            st.warning(
-                "Bitte einen Verkäufernamen eingeben."
-            )
-
+            st.warning("Bitte einen Verkäufernamen eingeben.")
         elif uploaded is None:
-
-            st.warning(
-                "Bitte eine JSON-Datei hochladen."
-            )
-
+            st.warning("Bitte eine JSON-Datei hochladen.")
         else:
-
             try:
-
                 cards = parse_json(uploaded)
-
-                collection_id = save_collection(
-                    seller.strip(),
-                    quote_percent,
-                    cards
-                )
-
-                total_cards = sum(
-                    card["quantity"]
-                    for card in cards
-                )
-
-                total_value = sum(
-                    card["price_cents"]
-                    * card["quantity"]
-                    for card in cards
-                )
-
-                st.success(
-                    "Sammlung erfolgreich gespeichert!"
-                )
-
-                st.write(
-                    f"**Sammlungs-ID:** {collection_id}"
-                )
-
-                st.write(
-                    f"**Karten:** {total_cards}"
-                )
-
-                st.write(
-                    f"**Sammlungswert:** "
-                    f"{euro(total_value)}"
-                )
-
-                st.info(
-                    "Die Sammlung liegt jetzt im Bereich "
-                    "'Sammlungen'. Sie wird erst nach dem "
-                    "Markieren als gekauft im Dashboard "
-                    "berücksichtigt."
-                )
-
+                cid = save_collection(seller.strip(), quote_percent, cards)
+                total = sum(card["quantity"] * card["price_cents"] for card in cards)
+                st.success(f"Sammlung #{cid} gespeichert!")
+                st.write("Karten:", sum(card["quantity"] for card in cards))
+                st.write("Sammlungswert:", money(total))
+                st.info("Die Sammlung liegt unter 'Sammlungen' und erscheint erst nach dem Kauf im Dashboard.")
             except ValueError as error:
                 st.error(str(error))
 
-
-# ============================================================
-# FOOTER
-# ============================================================
-
 st.divider()
-
-st.caption(
-    "Pokémon TCG Manager | "
-    "Cardvalue.ai Import · "
-    "Sammlungsverwaltung · "
-    "Cardmarket · "
-    "Excel-Export"
-)
+st.caption("Pokémon TCG Manager · Cardvalue.ai · Sammlungen · Cardmarket · Excel")
