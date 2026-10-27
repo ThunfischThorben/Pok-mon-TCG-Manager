@@ -518,4 +518,4 @@ def create_excel(collection, cards):
                 card["quantity"],
 
             "Cardvalue Einzelpreis (€)":
-                card["price_cents
+                card["price_cents"]
