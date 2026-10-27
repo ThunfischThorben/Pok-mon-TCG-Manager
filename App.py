@@ -1,19 +1,16 @@
 import io
-import json
-import re
+import hashlib
 import sqlite3
-
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
-from urllib.parse import urlencode
 
 import pandas as pd
 import streamlit as st
 
 
 # =====================================================
-# APP EINSTELLUNGEN
+# KONFIGURATION
 # =====================================================
 
 st.set_page_config(
@@ -23,48 +20,18 @@ st.set_page_config(
 )
 
 DB_PATH = Path("pokemon_manager.sqlite3")
+MARKUP_PERCENT = 20
 
-DEFAULT_QUOTE = 80
-
-LANGUAGES = {
-    "en": 1,
-    "eng": 1,
-    "english": 1,
-    "de": 3,
-    "ger": 3,
-    "german": 3,
-    "fr": 2,
-    "es": 4,
-    "it": 5,
-    "zh": 6,
-    "ja": 7,
-    "jp": 7,
-    "jpn": 7,
-    "pt": 8,
-    "ko": 10
-}
-
-LANGUAGE_NAMES = {
-    "en": "Englisch",
-    "de": "Deutsch",
-    "fr": "Französisch",
-    "es": "Spanisch",
-    "it": "Italienisch",
-    "ja": "Japanisch",
-    "jp": "Japanisch",
-    "pt": "Portugiesisch",
-    "ko": "Koreanisch",
-    "zh": "Chinesisch"
-}
-
-# Bestätigte Cardmarket-Produktseiten
-KNOWN_PRODUCTS = {
-    "swsh12.5gg-GG44": (
-        "https://www.cardmarket.com/en/Pokemon/"
-        "Products/Singles/Crown-Zenith/"
-        "Mewtwo-VSTAR-CRZGG44"
-    )
-}
+REQUIRED_COLUMNS = [
+    "Karten-ID",
+    "Kartenname",
+    "Set",
+    "Kartennummer",
+    "Sprache",
+    "Anzahl",
+    "Cardmarket-Direktlink",
+    "Cardmarket-Preis (€)"
+]
 
 
 # =====================================================
@@ -75,11 +42,18 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def cents(value):
+def to_cents(value):
+    if value is None or pd.isna(value):
+        raise ValueError("Ein Preis fehlt.")
+
+    if isinstance(value, str):
+        value = value.strip().replace("€", "").replace(" ", "")
+
+        if "," in value:
+            value = value.replace(".", "").replace(",", ".")
+
     try:
-        number = Decimal(
-            str(0 if value is None else value)
-        )
+        number = Decimal(str(value))
 
         if not number.is_finite() or number < 0:
             raise ValueError()
@@ -92,14 +66,12 @@ def cents(value):
         )
 
     except (ValueError, TypeError, ArithmeticError):
-        raise ValueError(
-            "Ungültiger Preis in der JSON-Datei."
-        )
+        raise ValueError(f"Ungültiger Preis: {value}")
 
 
-def money(value):
+def money(cents):
     return (
-        f"{value / 100:,.2f}"
+        f"{cents / 100:,.2f}"
         .replace(",", "X")
         .replace(".", ",")
         .replace("X", ".")
@@ -107,12 +79,10 @@ def money(value):
     )
 
 
-def percentage(value, pct):
+def selling_price(purchase_cents):
     return int(
         (
-            Decimal(value)
-            * Decimal(pct)
-            / Decimal(100)
+            Decimal(purchase_cents) * Decimal("1.20")
         ).quantize(
             Decimal("1"),
             rounding=ROUND_HALF_UP
@@ -120,485 +90,427 @@ def percentage(value, pct):
     )
 
 
-def card_language(card):
-    return str(
-        card["language"] or ""
-    ).lower().strip()
+def clean(value):
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip()
 
 
-def language_name(card):
-    key = card_language(card)
-
-    return LANGUAGE_NAMES.get(
-        key,
-        key or "Unbekannt"
-    )
+def card_key(card_id, language):
+    return f"{card_id.strip().lower()}|{language.strip().lower()}"
 
 
-def cardmarket_filters(card):
-    result = {
-        "sellerCountry": "7",
-        "minCondition": "2"
-    }
-
-    language = LANGUAGES.get(
-        card_language(card)
-    )
-
-    if language is not None:
-        result["language"] = str(language)
-
-    return result
-
-
-# =====================================================
-# CARDMARKET LINKS
-# =====================================================
-
-def direct_cardmarket_link(card):
-    """
-    Direkter Cardmarket-Link, wenn die
-    korrekte Produktseite bekannt ist.
-
-    Filter:
-    - Verkäuferland Deutschland
-    - Mindestens Near Mint
-    - Sprache aus JSON
-    """
-
-    card_id = str(
-        card["card_id"] or ""
-    ).strip()
-
-    product_url = KNOWN_PRODUCTS.get(
-        card_id
-    )
-
-    if not product_url:
-        return None
-
-    return (
-        product_url
-        + "?"
-        + urlencode(
-            cardmarket_filters(card)
-        )
-    )
-
-
-def web_search_link(card):
-    """
-    Normale Google-Websuche nach der
-    richtigen Cardmarket-Produktseite.
-
-    Verwendet:
-    - Kartenname
-    - Set
-    - Kartennummer
-    - Cardmarket-Domain
-    """
-
-    name = str(
-        card["name"] or ""
-    ).strip()
-
-    set_name = str(
-        card["set_name"] or ""
-    ).strip()
-
-    number = str(
-        card["number"] or ""
-    ).strip()
-
-    number_short = number.split("/")[0].strip()
-
-    query = " ".join(
-        part
-        for part in [
-            "site:cardmarket.com/en/Pokemon/Products/Singles/",
-            name,
-            set_name,
-            number_short
-        ]
-        if part
-    )
-
-    return (
-        "https://www.google.com/search?"
-        + urlencode({
-            "q": query
-        })
-    )
-
-
-def cardmarket_link(card):
-    """
-    Bekannte Produktseite direkt öffnen.
-    Sonst normale Websuche verwenden.
-    """
-
-    direct = direct_cardmarket_link(card)
-
-    if direct:
-        return direct
-
-    return web_search_link(card)
+def get_db():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
 
 
 # =====================================================
 # DATENBANK
 # =====================================================
 
-def db():
-    conn = sqlite3.connect(
-        DB_PATH,
-        timeout=30
-    )
-
-    conn.row_factory = sqlite3.Row
-
-    conn.execute(
-        "PRAGMA foreign_keys = ON"
-    )
-
-    return conn
-
-
 def init_db():
-    with db() as conn:
+    with get_db() as conn:
 
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS collections (
+            CREATE TABLE IF NOT EXISTS inventory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                seller TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'offen',
-                quote_percent INTEGER NOT NULL DEFAULT 80,
-                purchase_cents INTEGER,
-                purchased_at TEXT
-            )
-        """)
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS cards (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                collection_id INTEGER NOT NULL,
-                card_id TEXT,
+                card_key TEXT NOT NULL UNIQUE,
+                card_id TEXT NOT NULL,
                 name TEXT NOT NULL,
                 set_name TEXT,
-                number TEXT,
+                card_number TEXT,
+                language TEXT,
+                cardmarket_url TEXT,
+                quantity INTEGER NOT NULL DEFAULT 0,
+                purchase_total_cents INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS import_history (
+                file_hash TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                imported_at TEXT NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sales (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                inventory_id INTEGER NOT NULL,
+                card_id TEXT NOT NULL,
+                name TEXT NOT NULL,
                 language TEXT,
                 quantity INTEGER NOT NULL,
-                price_cents INTEGER NOT NULL,
-                image TEXT,
-                card_path TEXT,
-                FOREIGN KEY(collection_id)
-                    REFERENCES collections(id)
-                    ON DELETE CASCADE
+                purchase_total_cents INTEGER NOT NULL,
+                sale_total_cents INTEGER NOT NULL,
+                sold_at TEXT NOT NULL,
+                FOREIGN KEY(inventory_id)
+                    REFERENCES inventory(id)
             )
         """)
 
 
 # =====================================================
-# JSON IMPORT
+# DATEN LADEN
 # =====================================================
 
-def parse_json(file):
-    try:
-        data = json.load(file)
+def get_inventory():
+    with get_db() as conn:
+        return conn.execute("""
+            SELECT *
+            FROM inventory
+            ORDER BY name, card_number
+        """).fetchall()
 
-    except (ValueError, UnicodeDecodeError):
-        raise ValueError(
-            "Keine gültige JSON-Datei."
+
+def get_sales():
+    with get_db() as conn:
+        return conn.execute("""
+            SELECT *
+            FROM sales
+            ORDER BY id DESC
+        """).fetchall()
+
+
+def file_already_imported(file_hash):
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM import_history WHERE file_hash=?",
+            (file_hash,)
+        ).fetchone()
+
+    return row is not None
+
+
+# =====================================================
+# EXCEL EINLESEN
+# =====================================================
+
+def parse_excel(file_bytes):
+    try:
+        df = pd.read_excel(
+            io.BytesIO(file_bytes),
+            engine="openpyxl",
+            dtype={
+                "Karten-ID": str,
+                "Kartennummer": str,
+                "Sprache": str
+            }
         )
 
-    items = (
-        data.get("items")
-        if isinstance(data, dict)
-        else None
-    )
-
-    if not isinstance(items, list) or not items:
+    except Exception as error:
         raise ValueError(
-            "Die JSON-Datei enthält keine Karten."
+            f"Excel-Datei konnte nicht gelesen werden: {error}"
+        )
+
+    missing = [
+        col for col in REQUIRED_COLUMNS
+        if col not in df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "Diese Spalten fehlen: " + ", ".join(missing)
         )
 
     cards = []
 
-    for index, item in enumerate(
-        items,
-        start=1
-    ):
+    for index, row in df.iterrows():
+        excel_row = index + 2
 
-        if not isinstance(item, dict):
+        card_id = clean(row["Karten-ID"])
+        name = clean(row["Kartenname"])
+        set_name = clean(row["Set"])
+        number = clean(row["Kartennummer"])
+        language = clean(row["Sprache"]).lower()
+        link = clean(row["Cardmarket-Direktlink"])
+
+        if not card_id or not name or not language:
             raise ValueError(
-                f"Ungültiger Karteneintrag {index}."
+                f"Zeile {excel_row}: Karten-ID, Name oder Sprache fehlt."
             )
 
         try:
-            quantity = int(
-                item.get("quantity", 1)
-            )
+            quantity_value = row["Anzahl"]
+            quantity = int(quantity_value)
 
-            if quantity < 1:
+            if (
+                quantity < 1
+                or float(quantity_value) != quantity
+            ):
                 raise ValueError()
 
         except (ValueError, TypeError):
             raise ValueError(
-                f"Ungültige Menge bei Karte {index}."
+                f"Zeile {excel_row}: Ungültige Anzahl."
+            )
+
+        try:
+            purchase_cents = to_cents(
+                row["Cardmarket-Preis (€)"]
+            )
+
+        except ValueError:
+            raise ValueError(
+                f"Zeile {excel_row}: Bitte einen gültigen "
+                "Einkaufspreis in 'Cardmarket-Preis (€)' eintragen."
             )
 
         cards.append({
-            "card_id": str(
-                item.get("id") or ""
-            ),
-            "name": str(
-                item.get("name") or "Unbekannt"
-            ),
-            "set_name": str(
-                item.get("setName") or ""
-            ),
-            "number": str(
-                item.get("number") or ""
-            ),
-            "language": str(
-                item.get("language") or ""
-            ),
+            "card_key": card_key(card_id, language),
+            "card_id": card_id,
+            "name": name,
+            "set_name": set_name,
+            "card_number": number,
+            "language": language,
+            "cardmarket_url": link,
             "quantity": quantity,
-            "price_cents": cents(
-                item.get("addedEur")
-            ),
-            "image": str(
-                item.get("image") or ""
-            ),
-            "card_path": str(
-                item.get("path") or ""
-            )
+            "purchase_cents": purchase_cents
         })
+
+    if not cards:
+        raise ValueError("Die Excel-Datei enthält keine Karten.")
 
     return cards
 
 
 # =====================================================
-# SAMMLUNG SPEICHERN
+# IMPORT SPEICHERN
 # =====================================================
 
-def save_collection(seller, pct, cards):
-    with db() as conn:
+def import_cards(cards, file_hash, filename):
+    with get_db() as conn:
 
-        cursor = conn.execute("""
-            INSERT INTO collections (
-                seller,
-                created_at,
-                status,
-                quote_percent
+        existing_import = conn.execute(
+            "SELECT 1 FROM import_history WHERE file_hash=?",
+            (file_hash,)
+        ).fetchone()
+
+        if existing_import:
+            raise ValueError(
+                "Diese Datei wurde bereits importiert."
             )
-            VALUES (?, ?, 'offen', ?)
-        """, (
-            seller,
-            now(),
-            pct
-        ))
-
-        collection_id = cursor.lastrowid
 
         for card in cards:
+
+            existing = conn.execute("""
+                SELECT *
+                FROM inventory
+                WHERE card_key=?
+            """, (card["card_key"],)).fetchone()
+
+            new_purchase_total = (
+                card["purchase_cents"] * card["quantity"]
+            )
+
+            if existing:
+
+                conn.execute("""
+                    UPDATE inventory
+                    SET
+                        name=?,
+                        set_name=?,
+                        card_number=?,
+                        cardmarket_url=?,
+                        quantity=quantity+?,
+                        purchase_total_cents=purchase_total_cents+?,
+                        updated_at=?
+                    WHERE id=?
+                """, (
+                    card["name"],
+                    card["set_name"],
+                    card["card_number"],
+                    (
+                        card["cardmarket_url"]
+                        or existing["cardmarket_url"]
+                    ),
+                    card["quantity"],
+                    new_purchase_total,
+                    now(),
+                    existing["id"]
+                ))
+
+            else:
+
+                conn.execute("""
+                    INSERT INTO inventory (
+                        card_key,
+                        card_id,
+                        name,
+                        set_name,
+                        card_number,
+                        language,
+                        cardmarket_url,
+                        quantity,
+                        purchase_total_cents,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    card["card_key"],
+                    card["card_id"],
+                    card["name"],
+                    card["set_name"],
+                    card["card_number"],
+                    card["language"],
+                    card["cardmarket_url"],
+                    card["quantity"],
+                    new_purchase_total,
+                    now(),
+                    now()
+                ))
+
+        conn.execute("""
+            INSERT INTO import_history (
+                file_hash,
+                filename,
+                imported_at
+            )
+            VALUES (?, ?, ?)
+        """, (
+            file_hash,
+            filename,
+            now()
+        ))
+
+
+# =====================================================
+# MEHRFACHVERKAUF
+# =====================================================
+
+def sell_cards(sale_items):
+    """
+    sale_items:
+    [
+        {
+            "inventory_id": 1,
+            "quantity": 2,
+            "sale_unit_cents": 1200
+        }
+    ]
+    """
+
+    with get_db() as conn:
+
+        for item in sale_items:
+
+            card = conn.execute("""
+                SELECT *
+                FROM inventory
+                WHERE id=?
+            """, (
+                item["inventory_id"],
+            )).fetchone()
+
+            if not card:
+                raise ValueError("Karte nicht gefunden.")
+
+            quantity = item["quantity"]
+
+            if quantity < 1 or quantity > card["quantity"]:
+                raise ValueError(
+                    f"Ungültige Verkaufsmenge: {card['name']}"
+                )
+
+            old_quantity = card["quantity"]
+            old_total = card["purchase_total_cents"]
+
+            # Durchschnittlicher Einkaufspreis:
+            # Bei Teilverkäufen wird der Einkauf proportional
+            # auf die verkauften Exemplare verteilt.
+            if quantity == old_quantity:
+                purchase_total = old_total
+
+            else:
+                purchase_total = int(
+                    (
+                        Decimal(old_total)
+                        * Decimal(quantity)
+                        / Decimal(old_quantity)
+                    ).quantize(
+                        Decimal("1"),
+                        rounding=ROUND_HALF_UP
+                    )
+                )
+
+            sale_total = (
+                item["sale_unit_cents"] * quantity
+            )
+
             conn.execute("""
-                INSERT INTO cards (
-                    collection_id,
+                INSERT INTO sales (
+                    inventory_id,
                     card_id,
                     name,
-                    set_name,
-                    number,
                     language,
                     quantity,
-                    price_cents,
-                    image,
-                    card_path
+                    purchase_total_cents,
+                    sale_total_cents,
+                    sold_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                collection_id,
+                card["id"],
                 card["card_id"],
                 card["name"],
-                card["set_name"],
-                card["number"],
                 card["language"],
-                card["quantity"],
-                card["price_cents"],
-                card["image"],
-                card["card_path"]
+                quantity,
+                purchase_total,
+                sale_total,
+                now()
             ))
 
-    return collection_id
-
-
-# =====================================================
-# SAMMLUNGEN LADEN
-# =====================================================
-
-def get_collections():
-    with db() as conn:
-
-        return conn.execute("""
-            SELECT
-                c.*,
-
-                COALESCE(
-                    SUM(
-                        k.quantity * k.price_cents
-                    ),
-                    0
-                ) AS market_cents,
-
-                COALESCE(
-                    SUM(k.quantity),
-                    0
-                ) AS card_count
-
-            FROM collections c
-
-            LEFT JOIN cards k
-                ON k.collection_id = c.id
-
-            GROUP BY c.id
-
-            ORDER BY c.id DESC
-        """).fetchall()
-
-
-def get_cards(collection_id):
-    with db() as conn:
-
-        return conn.execute("""
-            SELECT *
-            FROM cards
-            WHERE collection_id = ?
-            ORDER BY id
-        """, (
-            collection_id,
-        )).fetchall()
-
-
-# =====================================================
-# KAUFVERWALTUNG
-# =====================================================
-
-def mark_purchased(collection_id, value):
-    with db() as conn:
-
-        conn.execute("""
-            UPDATE collections
-            SET
-                status = 'gekauft',
-                purchase_cents = ?,
-                purchased_at = ?
-            WHERE id = ?
-              AND status = 'offen'
-        """, (
-            value,
-            now(),
-            collection_id
-        ))
-
-
-def undo_purchase(collection_id):
-    with db() as conn:
-
-        conn.execute("""
-            UPDATE collections
-            SET
-                status = 'offen',
-                purchase_cents = NULL,
-                purchased_at = NULL
-            WHERE id = ?
-              AND status = 'gekauft'
-        """, (
-            collection_id,
-        ))
-
-
-def delete_collection(collection_id):
-    with db() as conn:
-
-        conn.execute("""
-            DELETE FROM collections
-            WHERE id = ?
-              AND status = 'offen'
-        """, (
-            collection_id,
-        ))
+            conn.execute("""
+                UPDATE inventory
+                SET
+                    quantity=quantity-?,
+                    purchase_total_cents=purchase_total_cents-?,
+                    updated_at=?
+                WHERE id=?
+            """, (
+                quantity,
+                purchase_total,
+                now(),
+                card["id"]
+            ))
 
 
 # =====================================================
 # EXCEL EXPORT
 # =====================================================
 
-def create_excel(collection, cards):
+def export_inventory(cards):
     rows = []
 
     for card in cards:
 
-        total = (
-            card["quantity"]
-            * card["price_cents"]
+        if card["quantity"] <= 0:
+            continue
+
+        avg_purchase = round(
+            card["purchase_total_cents"]
+            / card["quantity"]
         )
 
+        proposed_sale = selling_price(avg_purchase)
+
         rows.append({
-            "Verkäufer":
-                collection["seller"],
-
-            "Karten-ID":
-                card["card_id"],
-
-            "Kartenname":
-                card["name"],
-
-            "Set":
-                card["set_name"],
-
-            "Kartennummer":
-                card["number"],
-
-            "Sprache":
-                language_name(card),
-
-            "Zustand (Annahme)":
-                "Near Mint",
-
-            "Verkäuferland":
-                "Deutschland",
-
-            "Menge":
-                card["quantity"],
-
-            "Cardvalue Einzelpreis (€)":
-                card["price_cents"] / 100,
-
-            "Gesamtwert (€)":
-                total / 100,
-
-            "Ankaufsquote (%)":
-                collection["quote_percent"],
-
-            "Ankaufswert (€)":
-                percentage(
-                    total,
-                    collection["quote_percent"]
-                ) / 100,
-
-            "Bildlink":
-                card["image"],
-
-            "Cardmarket Link":
-                cardmarket_link(card),
-
-            "Linktyp":
-                (
-                    "Direkte Produktseite"
-                    if direct_cardmarket_link(card)
-                    else "Google-Websuche"
-                )
+            "Karten-ID": card["card_id"],
+            "Kartenname": card["name"],
+            "Set": card["set_name"],
+            "Kartennummer": card["card_number"],
+            "Sprache": card["language"],
+            "Anzahl": card["quantity"],
+            "Einkaufspreis (€)": avg_purchase / 100,
+            "Verkaufspreis +20% (€)": proposed_sale / 100,
+            "Cardmarket-Link": card["cardmarket_url"]
         })
 
     output = io.BytesIO()
@@ -610,41 +522,34 @@ def create_excel(collection, cards):
 
         pd.DataFrame(rows).to_excel(
             writer,
-            sheet_name="Sammlung",
-            index=False
+            index=False,
+            sheet_name="Kartenbestand"
         )
 
-        sheet = writer.sheets["Sammlung"]
-
+        sheet = writer.sheets["Kartenbestand"]
         sheet.freeze_panes(1, 0)
-
-        sheet.set_column("A:B", 23)
-        sheet.set_column("C:D", 30)
-        sheet.set_column("E:M", 20)
-        sheet.set_column("N:O", 65)
-        sheet.set_column("P:P", 25)
+        sheet.set_column("A:A", 20)
+        sheet.set_column("B:C", 30)
+        sheet.set_column("D:H", 20)
+        sheet.set_column("I:I", 70)
 
     return output.getvalue()
 
 
 # =====================================================
-# APP STARTEN
+# APP START
 # =====================================================
 
 init_db()
 
 st.title("🃏 Pokémon TCG Manager")
+st.caption("Einkauf · Verkauf · Bestand · Gewinn")
 
-st.write(
-    "Dein persönlicher Pokémon-Ankaufsmanager"
-)
-
-st.divider()
-
-tab_dashboard, tab_storage, tab_import = st.tabs([
+tab_dashboard, tab_inventory, tab_sales, tab_import = st.tabs([
     "📊 Dashboard",
-    "📦 Sammlungen",
-    "➕ Neue Sammlung"
+    "🃏 Kartenbestand",
+    "💰 Verkäufe",
+    "📥 Excel-Import"
 ])
 
 
@@ -656,414 +561,437 @@ with tab_dashboard:
 
     st.header("📊 Dashboard")
 
-    purchased = [
-        collection
-        for collection in get_collections()
-        if collection["status"] == "gekauft"
+    inventory = [
+        c for c in get_inventory()
+        if c["quantity"] > 0
     ]
 
+    sales = get_sales()
+
+    total_cards = sum(
+        c["quantity"] for c in inventory
+    )
+
     invested = sum(
-        collection["purchase_cents"] or 0
-        for collection in purchased
+        c["purchase_total_cents"]
+        for c in inventory
     )
 
-    market = sum(
-        collection["market_cents"]
-        for collection in purchased
+    proposed_sales = sum(
+        selling_price(
+            round(
+                c["purchase_total_cents"]
+                / c["quantity"]
+            )
+        ) * c["quantity"]
+        for c in inventory
     )
 
-    col1, col2, col3 = st.columns(3)
+    realized_revenue = sum(
+        s["sale_total_cents"]
+        for s in sales
+    )
 
-    with col1:
-        st.metric(
-            "Investiertes Kapital",
-            money(invested)
-        )
+    realized_cost = sum(
+        s["purchase_total_cents"]
+        for s in sales
+    )
 
-    with col2:
-        st.metric(
-            "Warenwert",
-            money(market)
-        )
+    col1, col2, col3, col4 = st.columns(4)
 
-    with col3:
-        st.metric(
-            "Rechnerische Differenz",
-            money(market - invested)
-        )
+    col1.metric(
+        "Karten im Bestand",
+        total_cards
+    )
 
-    st.caption(
-        "Nur gekaufte Sammlungen. "
-        "Die Warenwerte basieren auf den "
-        "importierten Cardvalue.ai-Preisen. "
-        "Gebühren und Versand sind nicht enthalten."
+    col2.metric(
+        "Investiertes Kapital",
+        money(invested)
+    )
+
+    col3.metric(
+        "Geplanter Verkaufswert",
+        money(proposed_sales)
+    )
+
+    col4.metric(
+        "Möglicher Gewinn",
+        money(proposed_sales - invested)
     )
 
     st.divider()
 
-    st.subheader("📦 Gekaufte Sammlungen")
+    st.subheader("💰 Bisherige Verkäufe")
 
-    if not purchased:
+    a, b, c = st.columns(3)
+
+    a.metric(
+        "Umsatz",
+        money(realized_revenue)
+    )
+
+    b.metric(
+        "Wareneinsatz verkauft",
+        money(realized_cost)
+    )
+
+    c.metric(
+        "Realisierter Gewinn",
+        money(realized_revenue - realized_cost)
+    )
+
+    st.caption(
+        "Alle Werte ohne Verkaufsgebühren, "
+        "Versandkosten und Steuern."
+    )
+
+
+# =====================================================
+# KARTENBESTAND
+# =====================================================
+
+with tab_inventory:
+
+    st.header("🃏 Kartenbestand")
+
+    cards = [
+        c for c in get_inventory()
+        if c["quantity"] > 0
+    ]
+
+    if not cards:
         st.info(
-            "Noch keine Sammlung als gekauft markiert."
+            "Noch keine Karten vorhanden. "
+            "Lade zuerst eine Excel-Datei hoch."
         )
 
-    for collection in purchased:
+    else:
 
-        with st.expander(
-            f'✅ {collection["seller"]} – '
-            f'{money(collection["market_cents"])}'
-        ):
+        search = st.text_input(
+            "🔎 Karte suchen",
+            placeholder="Name, Set oder Kartennummer"
+        )
 
-            st.write(
-                "Karten:",
-                collection["card_count"]
+        filtered = []
+
+        for card in cards:
+
+            searchable = (
+                card["name"]
+                + " "
+                + (card["set_name"] or "")
+                + " "
+                + (card["card_number"] or "")
+            ).lower()
+
+            if search.lower() in searchable:
+                filtered.append(card)
+
+        rows = []
+
+        for card in filtered:
+
+            avg_purchase = round(
+                card["purchase_total_cents"]
+                / card["quantity"]
             )
 
-            st.write(
-                "Kaufpreis:",
-                money(
-                    collection["purchase_cents"] or 0
-                )
-            )
+            proposed = selling_price(avg_purchase)
 
-            st.write(
-                "Warenwert:",
-                money(collection["market_cents"])
-            )
+            rows.append({
+                "ID": card["id"],
+                "Karte": card["name"],
+                "Set": card["set_name"],
+                "Nummer": card["card_number"],
+                "Sprache": card["language"],
+                "Bestand": card["quantity"],
+                "EK (€)": avg_purchase / 100,
+                "VK +20% (€)": proposed / 100,
+                "Cardmarket": card["cardmarket_url"]
+            })
 
-            st.write(
-                "Rechnerische Differenz:",
-                money(
-                    collection["market_cents"]
-                    - (
-                        collection["purchase_cents"]
-                        or 0
+        if rows:
+
+            st.dataframe(
+                pd.DataFrame(rows),
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Cardmarket": st.column_config.LinkColumn(
+                        "Cardmarket"
+                    ),
+                    "EK (€)": st.column_config.NumberColumn(
+                        "EK (€)",
+                        format="%.2f €"
+                    ),
+                    "VK +20% (€)": st.column_config.NumberColumn(
+                        "VK +20% (€)",
+                        format="%.2f €"
                     )
-                )
+                }
             )
 
+        st.divider()
+
+        st.download_button(
+            "📥 Gesamten Kartenbestand als Excel herunterladen",
+            data=export_inventory(cards),
+            file_name="Pokemon_Kartenbestand.xlsx",
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            )
+        )
+
 
 # =====================================================
-# SAMMLUNGEN
+# VERKÄUFE
 # =====================================================
 
-with tab_storage:
+with tab_sales:
 
-    st.header("📦 Gespeicherte Sammlungen")
+    st.header("💰 Karten verkaufen")
 
-    collections = get_collections()
+    available = [
+        c for c in get_inventory()
+        if c["quantity"] > 0
+    ]
 
-    if not collections:
+    if not available:
         st.info(
-            "Noch keine Sammlungen gespeichert."
+            "Aktuell sind keine Karten zum Verkauf verfügbar."
         )
 
-    for collection in collections:
+    else:
 
-        cid = collection["id"]
+        options = {
+            (
+                f"{c['name']} | "
+                f"{c['card_number']} | "
+                f"{c['language']} | "
+                f"Bestand: {c['quantity']} "
+                f"[ID {c['id']}]"
+            ): c
+            for c in available
+        }
 
-        market = collection["market_cents"]
-
-        suggested = percentage(
-            market,
-            collection["quote_percent"]
+        selected = st.multiselect(
+            "Karten auswählen",
+            options=list(options.keys())
         )
 
-        status = collection["status"]
-
-        status_text = (
-            "✅ Gekauft"
-            if status == "gekauft"
-            else "🕒 Offen"
-        )
-
-        with st.expander(
-            f'{status_text} | '
-            f'{collection["seller"]} | '
-            f'{money(market)}'
-        ):
+        if selected:
 
             st.write(
-                "**Verkäufer:**",
-                collection["seller"]
+                "Lege die verkauften Mengen und "
+                "tatsächlichen Verkaufspreise fest."
             )
 
-            st.write(
-                "**Karten:**",
-                collection["card_count"]
-            )
+            sale_items = []
 
-            st.write(
-                "**Sammlungswert:**",
-                money(market)
-            )
+            with st.form("sales_form"):
 
-            st.write(
-                "**Ankaufsquote:**",
-                f'{collection["quote_percent"]} %'
-            )
+                for label in selected:
 
-            st.write(
-                "**Empfohlener Ankauf:**",
-                money(suggested)
-            )
-
-            st.divider()
-
-            st.subheader("🃏 Karten")
-
-            cards = get_cards(cid)
-
-            for card in cards:
-
-                left, right = st.columns([1, 4])
-
-                with left:
-
-                    if card["image"]:
-
-                        try:
-                            st.image(
-                                card["image"],
-                                width=120
-                            )
-
-                        except Exception:
-                            st.caption(
-                                "Bild nicht verfügbar"
-                            )
-
-                with right:
+                    card = options[label]
 
                     st.markdown(
-                        f'**{card["name"]}**'
+                        f"**{card['name']} – "
+                        f"{card['card_number']}**"
                     )
 
-                    st.write(
-                        f'{card["set_name"]} | '
-                        f'{card["number"]}'
+                    avg_purchase = round(
+                        card["purchase_total_cents"]
+                        / card["quantity"]
                     )
 
-                    st.write(
-                        f'Sprache: '
-                        f'{language_name(card)} | '
-                        f'Menge: {card["quantity"]}'
-                    )
+                    proposed = selling_price(avg_purchase)
 
-                    st.write(
-                        "Einzelpreis:",
-                        money(card["price_cents"])
-                    )
+                    col1, col2 = st.columns(2)
 
-                    direct = direct_cardmarket_link(card)
+                    with col1:
 
-                    if direct:
-
-                        st.link_button(
-                            "🔗 Cardmarket – passende Angebote",
-                            direct
+                        qty = st.number_input(
+                            "Verkaufte Menge",
+                            min_value=1,
+                            max_value=card["quantity"],
+                            value=1,
+                            step=1,
+                            key=f"sale_qty_{card['id']}"
                         )
 
-                        st.caption(
-                            "Direkte Produktseite mit "
-                            "Kartensprache, Deutschland "
-                            "und mindestens Near Mint."
+                    with col2:
+
+                        sale_price = st.number_input(
+                            "Tatsächlicher Verkaufspreis pro Karte (€)",
+                            min_value=0.0,
+                            value=proposed / 100,
+                            step=0.50,
+                            format="%.2f",
+                            key=f"sale_price_{card['id']}"
                         )
 
-                    else:
+                    sale_items.append({
+                        "inventory_id": card["id"],
+                        "quantity": qty,
+                        "sale_unit_cents": to_cents(sale_price)
+                    })
 
-                        st.link_button(
-                            "🔎 Cardmarket über Google suchen",
-                            web_search_link(card)
-                        )
+                    st.divider()
 
-                        st.caption(
-                            "Normale Websuche nach der "
-                            "richtigen Cardmarket-Karte. "
-                            "Die Angebotsfilter werden "
-                            "erst bei einem bekannten "
-                            "Produktlink automatisch gesetzt."
-                        )
-
-                st.divider()
-
-            excel = create_excel(
-                collection,
-                cards
-            )
-
-            st.download_button(
-                "📥 Excel herunterladen",
-                data=excel,
-                file_name=f"sammlung_{cid}.xlsx",
-                mime=(
-                    "application/vnd.openxmlformats-"
-                    "officedocument.spreadsheetml.sheet"
-                ),
-                key=f"excel_{cid}"
-            )
-
-            st.divider()
-
-            if status == "offen":
-
-                purchase_eur = st.number_input(
-                    "Tatsächlicher Kaufpreis (€)",
-                    min_value=0.0,
-                    value=suggested / 100,
-                    step=1.0,
-                    key=f"purchase_{cid}"
+                submitted = st.form_submit_button(
+                    "✅ Ausgewählte Karten als verkauft markieren",
+                    type="primary",
+                    use_container_width=True
                 )
 
-                if st.button(
-                    "✅ Als gekauft markieren",
-                    key=f"buy_{cid}",
-                    type="primary"
-                ):
+            if submitted:
 
-                    mark_purchased(
-                        cid,
-                        cents(purchase_eur)
+                try:
+
+                    sell_cards(sale_items)
+
+                    st.success(
+                        "Verkäufe gespeichert! "
+                        "Der Kartenbestand wurde aktualisiert."
                     )
 
                     st.rerun()
 
-                with st.popover(
-                    "🗑️ Sammlung löschen"
-                ):
+                except ValueError as error:
 
-                    st.warning(
-                        "Diese Sammlung wird "
-                        "dauerhaft gelöscht."
-                    )
+                    st.error(str(error))
 
-                    if st.button(
-                        "Löschen bestätigen",
-                        key=f"delete_{cid}"
-                    ):
+    st.divider()
 
-                        delete_collection(cid)
+    st.subheader("📜 Verkaufshistorie")
 
-                        st.rerun()
+    sales = get_sales()
 
-            else:
+    if not sales:
 
-                st.success(
-                    "Diese Sammlung ist gekauft "
-                    "und im Dashboard enthalten."
-                )
+        st.info(
+            "Noch keine Verkäufe gespeichert."
+        )
 
-                st.write(
-                    "Tatsächlicher Kaufpreis:",
-                    money(
-                        collection["purchase_cents"]
-                        or 0
-                    )
-                )
+    else:
 
-                if st.button(
-                    "↩️ Kauf rückgängig machen",
-                    key=f"undo_{cid}"
-                ):
+        history = []
 
-                    undo_purchase(cid)
+        for sale in sales:
 
-                    st.rerun()
+            history.append({
+                "Datum": sale["sold_at"][:10],
+                "Karte": sale["name"],
+                "Sprache": sale["language"],
+                "Menge": sale["quantity"],
+                "Einkauf gesamt (€)":
+                    sale["purchase_total_cents"] / 100,
+                "Verkauf gesamt (€)":
+                    sale["sale_total_cents"] / 100,
+                "Gewinn (€)":
+                    (
+                        sale["sale_total_cents"]
+                        - sale["purchase_total_cents"]
+                    ) / 100
+            })
+
+        st.dataframe(
+            pd.DataFrame(history),
+            hide_index=True,
+            use_container_width=True
+        )
 
 
 # =====================================================
-# NEUE SAMMLUNG
+# EXCEL IMPORT
 # =====================================================
 
 with tab_import:
 
-    st.header("➕ Neue Sammlung anlegen")
+    st.header("📥 Neue Karten importieren")
 
     st.write(
-        "Lade eine Cardvalue.ai-JSON-Datei hoch. "
-        "Kartensprache, Kartennummer, Set, "
-        "Bilder und Preise werden übernommen."
+        "Lade die Excel-Datei aus deinem "
+        "Cardmarket-Link-Finder-Projekt hoch."
     )
 
-    with st.form("import_form"):
+    st.info(
+        "Die Spalte 'Cardmarket-Preis (€)' "
+        "wird als Einkaufspreis verwendet. "
+        "Der Verkaufspreis wird automatisch "
+        "mit 20 % Aufschlag berechnet."
+    )
 
-        seller = st.text_input(
-            "Name des Verkäufers / der Sammlung"
-        )
+    uploaded = st.file_uploader(
+        "Excel-Datei auswählen",
+        type=["xlsx"]
+    )
 
-        uploaded = st.file_uploader(
-            "Cardvalue.ai JSON-Datei",
-            type=["json"]
-        )
+    if uploaded is not None:
 
-        quote_percent = st.slider(
-            "Ankaufsquote (%)",
-            min_value=0,
-            max_value=100,
-            value=DEFAULT_QUOTE
-        )
+        file_bytes = uploaded.getvalue()
 
-        submitted = st.form_submit_button(
-            "📦 Sammlung speichern",
-            type="primary",
-            use_container_width=True
-        )
+        file_hash = hashlib.sha256(
+            file_bytes
+        ).hexdigest()
 
-    if submitted:
-
-        if not seller.strip():
+        if file_already_imported(file_hash):
 
             st.warning(
-                "Bitte einen Verkäufernamen eingeben."
-            )
-
-        elif uploaded is None:
-
-            st.warning(
-                "Bitte eine JSON-Datei hochladen."
+                "Diese Datei wurde bereits importiert. "
+                "Es werden keine doppelten Karten angelegt."
             )
 
         else:
 
             try:
 
-                cards = parse_json(uploaded)
-
-                cid = save_collection(
-                    seller.strip(),
-                    quote_percent,
-                    cards
-                )
-
-                total = sum(
-                    card["quantity"]
-                    * card["price_cents"]
-                    for card in cards
-                )
+                cards = parse_excel(file_bytes)
 
                 st.success(
-                    f"Sammlung #{cid} gespeichert!"
+                    f"{len(cards)} Kartenpositionen erkannt."
                 )
 
-                st.write(
-                    "Karten:",
-                    sum(
-                        card["quantity"]
-                        for card in cards
+                preview = []
+
+                for card in cards:
+
+                    preview.append({
+                        "Karte": card["name"],
+                        "Sprache": card["language"],
+                        "Anzahl": card["quantity"],
+                        "Einkaufspreis (€)":
+                            card["purchase_cents"] / 100,
+                        "Verkaufspreis +20% (€)":
+                            selling_price(
+                                card["purchase_cents"]
+                            ) / 100
+                    })
+
+                st.dataframe(
+                    pd.DataFrame(preview),
+                    hide_index=True,
+                    use_container_width=True
+                )
+
+                if st.button(
+                    "✅ Karten importieren",
+                    type="primary",
+                    use_container_width=True
+                ):
+
+                    import_cards(
+                        cards,
+                        file_hash,
+                        uploaded.name
                     )
-                )
 
-                st.write(
-                    "Sammlungswert:",
-                    money(total)
-                )
+                    st.success(
+                        "Alle Karten wurden erfolgreich importiert!"
+                    )
 
-                st.info(
-                    "Die Sammlung liegt unter "
-                    "'Sammlungen' und erscheint "
-                    "erst nach dem Kauf im Dashboard."
-                )
+                    st.rerun()
 
             except ValueError as error:
 
@@ -1077,9 +1005,9 @@ with tab_import:
 st.divider()
 
 st.caption(
-    "Pokémon TCG Manager · "
-    "Cardvalue.ai · "
-    "Sammlungen · "
-    "Cardmarket · "
-    "Excel"
+    "Pokémon TCG Manager | "
+    "Excel-Import | "
+    "20 % Verkaufsaufschlag | "
+    "Bestandsverwaltung | "
+    "Mehrfachverkauf"
 )
