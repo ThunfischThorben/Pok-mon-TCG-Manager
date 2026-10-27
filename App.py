@@ -6,15 +6,15 @@ import sqlite3
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
-from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
+from urllib.parse import urlencode, urlparse, urlunparse
 
 import pandas as pd
 import streamlit as st
 
 
-# =====================================================
-# KONFIGURATION
-# =====================================================
+# ============================================================
+# EINSTELLUNGEN
+# ============================================================
 
 st.set_page_config(
     page_title="Pokémon TCG Manager",
@@ -26,9 +26,7 @@ DB_PATH = Path("pokemon_manager.sqlite3")
 
 DEFAULT_QUOTE = 80
 
-CARDMARKET_BASE = (
-    "https://www.cardmarket.com/en/Pokemon"
-)
+CARDMARKET_BASE = "https://www.cardmarket.com/en/Pokemon"
 
 # Cardmarket-Sprachcodes
 LANGUAGE_IDS = {
@@ -68,13 +66,11 @@ LANGUAGE_IDS = {
     "japanisch": 7,
 
     "pt": 8,
-    "por": 8,
     "portuguese": 8,
     "portugiesisch": 8,
 
     "ko": 10,
     "kr": 10,
-    "kor": 10,
     "korean": 10,
     "koreanisch": 10
 }
@@ -92,10 +88,26 @@ LANGUAGE_NAMES = {
     "zh": "Chinesisch"
 }
 
+# Verifizierte Cardmarket-Produktadressen.
+# Neue bestätigte Zuordnungen können ergänzt werden.
+#
+# Format:
+#   Cardvalue-ID: Cardmarket-Produktadresse
+#
+# Die Sprache wird später automatisch als Filter ergänzt.
 
-# =====================================================
-# HILFSFUNKTIONEN
-# =====================================================
+KNOWN_CARDMARKET_PRODUCTS = {
+    "swsh12.5gg-GG44": (
+        "https://www.cardmarket.com/en/Pokemon/"
+        "Products/Singles/Crown-Zenith/"
+        "Mewtwo-VSTAR-CRZGG44"
+    )
+}
+
+
+# ============================================================
+# ALLGEMEINE HILFSFUNKTIONEN
+# ============================================================
 
 def now():
     return datetime.now(timezone.utc).isoformat()
@@ -107,10 +119,7 @@ def to_cents(value):
             str(value if value is not None else 0)
         )
 
-        if not amount.is_finite():
-            raise ValueError()
-
-        if amount < 0:
+        if not amount.is_finite() or amount < 0:
             raise ValueError()
 
         return int(
@@ -120,29 +129,20 @@ def to_cents(value):
             )
         )
 
-    except (
-        ValueError,
-        TypeError,
-        ArithmeticError
-    ):
-        raise ValueError(
-            "Ungültiger Euro-Preis."
-        )
+    except (ValueError, TypeError, ArithmeticError):
+        raise ValueError("Ungültiger Euro-Preis.")
 
 
 def euro(cents):
     amount = cents / 100
 
-    formatted = f"{amount:,.2f}"
-
-    formatted = (
-        formatted
+    return (
+        f"{amount:,.2f}"
         .replace(",", "X")
         .replace(".", ",")
         .replace("X", ".")
+        + " €"
     )
-
-    return formatted + " €"
 
 
 def percent_value(cents, percent):
@@ -158,6 +158,11 @@ def percent_value(cents, percent):
     )
 
 
+def language_id(language):
+    key = str(language or "").strip().lower()
+    return LANGUAGE_IDS.get(key)
+
+
 def language_name(language):
     key = str(language or "").strip().lower()
 
@@ -167,75 +172,24 @@ def language_name(language):
     )
 
 
-def language_id(language):
-    key = str(language or "").strip().lower()
-
-    return LANGUAGE_IDS.get(key)
-
-
-def safe_filename(text):
-    result = re.sub(
+def safe_filename(value):
+    text = re.sub(
         r"[^a-zA-Z0-9_-]+",
         "_",
-        str(text)
+        str(value)
     )
 
-    return result.strip("_")[:60] or "sammlung"
+    return text.strip("_")[:60] or "sammlung"
 
 
-# =====================================================
+# ============================================================
 # CARDMARKET
-# =====================================================
+# ============================================================
 
-def cardmarket_search_link(card):
+def validate_cardmarket_url(url):
     """
-    Direkte Suche auf Cardmarket.
-
-    Ohne Cardmarket-Produkt-ID lässt sich eine
-    bestimmte Produktseite nicht sicher bestimmen.
-    """
-
-    name = str(
-        card["name"] or ""
-    ).strip()
-
-    number = str(
-        card["number"] or ""
-    ).strip()
-
-    set_name = str(
-        card["set_name"] or ""
-    ).strip()
-
-    # Bei Nummern wie 180/196 wird die
-    # eigentliche Sammlernummer verwendet.
-    collector_number = number.split("/")[0].strip()
-
-    search_text = " ".join(
-        value
-        for value in [
-            name,
-            collector_number,
-            set_name
-        ]
-        if value
-    )
-
-    parameters = {
-        "searchString": search_text
-    }
-
-    return (
-        CARDMARKET_BASE
-        + "/Products/Search?"
-        + urlencode(parameters)
-    )
-
-
-def normalize_cardmarket_product_url(url):
-    """
-    Akzeptiert nur echte Cardmarket-Produktseiten
-    im Pokémon-Einzelkartenbereich.
+    Prüft, ob eine URL zu einer echten
+    Cardmarket-Pokémon-Einzelkarten-Produktseite gehört.
     """
 
     url = str(url or "").strip()
@@ -245,123 +199,147 @@ def normalize_cardmarket_product_url(url):
 
     parsed = urlparse(url)
 
-    hostname = (
-        parsed.hostname or ""
-    ).lower()
-
-    valid_hosts = {
-        "cardmarket.com",
-        "www.cardmarket.com"
-    }
-
     if parsed.scheme != "https":
         raise ValueError(
             "Bitte einen HTTPS-Link verwenden."
         )
 
-    if hostname not in valid_hosts:
-        raise ValueError(
-            "Der Link muss von Cardmarket stammen."
-        )
-
-    if not re.match(
-        r"^/(?:en|de|fr|it|es)/Pokemon/"
-        r"Products/Singles/[^/]+/[^/]+/?$",
-        parsed.path
+    if parsed.hostname not in (
+        "cardmarket.com",
+        "www.cardmarket.com"
     ):
         raise ValueError(
-            "Bitte die direkte Produktseite einer "
-            "Pokémon-Einzelkarte einfügen."
+            "Bitte einen Link von Cardmarket verwenden."
         )
 
-    return urlunparse(
-        (
-            "https",
-            "www.cardmarket.com",
-            parsed.path,
-            "",
-            "",
-            ""
-        )
+    pattern = (
+        r"^/(?:en|de|fr|es|it)/Pokemon/"
+        r"Products/Singles/[^/]+/[^/]+/?$"
     )
 
+    if not re.match(pattern, parsed.path):
+        raise ValueError(
+            "Bitte die direkte Cardmarket-Produktseite "
+            "einer Pokémon-Einzelkarte einfügen."
+        )
 
-def cardmarket_product_link(card):
+    # Vorhandene Filter entfernen.
+    # Sie werden anhand der Karte neu erzeugt.
+    return urlunparse((
+        "https",
+        "www.cardmarket.com",
+        parsed.path,
+        "",
+        "",
+        ""
+    ))
+
+
+def cardmarket_product_url(card):
     """
-    Baut einen gefilterten Link für eine
-    bekannte Cardmarket-Produktseite.
+    Liefert eine bekannte exakte Produktadresse.
 
-    Sprache: aus der JSON-Datei
-    Zustand: mindestens Near Mint
-    Verkäuferland: Deutschland
+    Priorität:
+    1. Individuell gespeicherte Produktadresse
+    2. Bekannte Zuordnung über Cardvalue-Karten-ID
     """
 
-    product_url = str(
+    saved_url = str(
         card["cardmarket_url"] or ""
     ).strip()
+
+    if saved_url:
+        try:
+            return validate_cardmarket_url(saved_url)
+        except ValueError:
+            pass
+
+    card_id = str(
+        card["card_id"] or ""
+    ).strip()
+
+    known_url = KNOWN_CARDMARKET_PRODUCTS.get(card_id)
+
+    if known_url:
+        return known_url
+
+    return None
+
+
+def cardmarket_filtered_link(card):
+    """
+    Direkter Cardmarket-Produktlink.
+
+    Filter:
+    sellerCountry=7  -> Deutschland
+    minCondition=2   -> mindestens Near Mint
+    language=...     -> Sprache der Karte
+    """
+
+    product_url = cardmarket_product_url(card)
 
     if not product_url:
         return None
 
-    try:
-        product_url = normalize_cardmarket_product_url(
-            product_url
-        )
+    lang = language_id(card["language"])
 
-    except ValueError:
-        return None
+    parameters = {
+        "sellerCountry": "7",
+        "minCondition": "2"
+    }
 
-    parsed = urlparse(product_url)
+    if lang is not None:
+        parameters["language"] = str(lang)
 
-    parameters = dict(
-        parse_qsl(
-            parsed.query,
-            keep_blank_values=True
-        )
+    return (
+        product_url
+        + "?"
+        + urlencode(parameters)
     )
 
-    card_language = language_id(
-        card["language"]
+
+def cardmarket_search_link(card):
+    """
+    Direkte Cardmarket-Suche für Karten,
+    deren exakte Produktseite noch nicht
+    bekannt ist.
+    """
+
+    name = str(card["name"] or "").strip()
+    number = str(card["number"] or "").strip()
+    set_name = str(card["set_name"] or "").strip()
+
+    number = number.split("/")[0].strip()
+
+    search_text = " ".join(
+        part
+        for part in (
+            name,
+            number,
+            set_name
+        )
+        if part
     )
 
-    if card_language is not None:
-        parameters["language"] = str(
-            card_language
-        )
-
-    # Cardmarket:
-    # 1 = Mint
-    # 2 = Near Mint
-    parameters["minCondition"] = "2"
-
-    # Deutschland
-    parameters["sellerCountry"] = "7"
-
-    return urlunparse(
-        parsed._replace(
-            query=urlencode(parameters),
-            fragment=""
-        )
+    return (
+        CARDMARKET_BASE
+        + "/Products/Search?"
+        + urlencode({
+            "searchString": search_text
+        })
     )
 
 
 def cardmarket_link(card):
-    """
-    Exakte Produktseite, falls vorhanden.
-    Andernfalls direkte Cardmarket-Suche.
-    """
-
-    product_link = cardmarket_product_link(card)
-
-    if product_link:
-        return product_link
-
-    return cardmarket_search_link(card)
+    return (
+        cardmarket_filtered_link(card)
+        or cardmarket_search_link(card)
+    )
 
 
-# =====================================================
+# ============================================================
 # DATENBANK
-# =====================================================
+# ============================================================
 
 def get_db():
     conn = sqlite3.connect(
@@ -413,8 +391,8 @@ def init_db():
             )
         """)
 
-        # Bestehende Datenbank automatisch erweitern.
-        # Bereits gespeicherte Sammlungen bleiben erhalten.
+        # Bestehende Datenbank erweitern,
+        # ohne Sammlungen zu löschen.
 
         columns = [
             row["name"]
@@ -430,18 +408,15 @@ def init_db():
             """)
 
 
-# =====================================================
+# ============================================================
 # JSON IMPORT
-# =====================================================
+# ============================================================
 
 def parse_json(uploaded_file):
     try:
         data = json.load(uploaded_file)
 
-    except (
-        ValueError,
-        UnicodeDecodeError
-    ):
+    except (ValueError, UnicodeDecodeError):
         raise ValueError(
             "Die Datei ist kein gültiges JSON."
         )
@@ -460,10 +435,7 @@ def parse_json(uploaded_file):
 
     cards = []
 
-    for index, item in enumerate(
-        items,
-        start=1
-    ):
+    for index, item in enumerate(items, start=1):
 
         if not isinstance(item, dict):
             raise ValueError(
@@ -478,29 +450,22 @@ def parse_json(uploaded_file):
             if quantity < 1:
                 raise ValueError()
 
-        except (
-            TypeError,
-            ValueError
-        ):
+        except (TypeError, ValueError):
             raise ValueError(
                 f"Ungültige Stückzahl bei Karte {index}."
             )
 
-        cardmarket_url = str(
+        raw_url = str(
             item.get("cardmarketUrl")
             or item.get("cardmarket_url")
             or ""
         ).strip()
 
-        if cardmarket_url:
+        if raw_url:
             try:
-                cardmarket_url = (
-                    normalize_cardmarket_product_url(
-                        cardmarket_url
-                    )
-                )
+                raw_url = validate_cardmarket_url(raw_url)
             except ValueError:
-                cardmarket_url = ""
+                raw_url = ""
 
         cards.append({
             "card_id": str(
@@ -528,21 +493,17 @@ def parse_json(uploaded_file):
             "card_path": str(
                 item.get("path") or ""
             ),
-            "cardmarket_url": cardmarket_url
+            "cardmarket_url": raw_url
         })
 
     return cards
 
 
-# =====================================================
-# SAMMLUNG SPEICHERN
-# =====================================================
+# ============================================================
+# SAMMLUNGEN SPEICHERN
+# ============================================================
 
-def save_collection(
-    seller,
-    quote_percent,
-    cards
-):
+def save_collection(seller, quote_percent, cards):
     with get_db() as conn:
 
         cursor = conn.execute("""
@@ -576,9 +537,7 @@ def save_collection(
                     card_path,
                     cardmarket_url
                 )
-                VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 collection_id,
                 card["card_id"],
@@ -596,10 +555,6 @@ def save_collection(
     return collection_id
 
 
-# =====================================================
-# SAMMLUNGEN LADEN
-# =====================================================
-
 def get_collections():
     with get_db() as conn:
 
@@ -608,9 +563,7 @@ def get_collections():
                 c.*,
 
                 COALESCE(
-                    SUM(
-                        k.quantity * k.price_cents
-                    ),
+                    SUM(k.quantity * k.price_cents),
                     0
                 ) AS market_cents,
 
@@ -646,13 +599,11 @@ def get_cards(collection_id):
 def save_cardmarket_url(
     card_id,
     collection_id,
-    product_url
+    url
 ):
     normalized = (
-        normalize_cardmarket_product_url(
-            product_url
-        )
-        if product_url.strip()
+        validate_cardmarket_url(url)
+        if str(url).strip()
         else ""
     )
 
@@ -669,16 +620,12 @@ def save_cardmarket_url(
         ))
 
 
-# =====================================================
+# ============================================================
 # KAUFVERWALTUNG
-# =====================================================
+# ============================================================
 
-def mark_purchased(
-    collection_id,
-    purchase_cents
-):
+def mark_purchased(collection_id, purchase_cents):
     with get_db() as conn:
-
         conn.execute("""
             UPDATE collections
             SET
@@ -696,7 +643,6 @@ def mark_purchased(
 
 def undo_purchase(collection_id):
     with get_db() as conn:
-
         conn.execute("""
             UPDATE collections
             SET
@@ -712,7 +658,6 @@ def undo_purchase(collection_id):
 
 def delete_collection(collection_id):
     with get_db() as conn:
-
         conn.execute("""
             DELETE FROM collections
             WHERE id = ?
@@ -722,9 +667,9 @@ def delete_collection(collection_id):
         ))
 
 
-# =====================================================
+# ============================================================
 # EXCEL EXPORT
-# =====================================================
+# ============================================================
 
 def create_excel(collection, cards):
     rows = []
@@ -742,55 +687,30 @@ def create_excel(collection, cards):
         )
 
         rows.append({
-            "Verkäufer":
-                collection["seller"],
-
-            "Karten-ID":
-                card["card_id"],
-
-            "Kartenname":
-                card["name"],
-
-            "Set":
-                card["set_name"],
-
-            "Kartennummer":
-                card["number"],
-
-            "Sprache":
-                language_name(card["language"]),
-
-            "Zustand (Annahme)":
-                "Near Mint",
-
-            "Verkäuferland (Vorgabe)":
-                "Deutschland",
-
-            "Menge":
-                card["quantity"],
-
+            "Verkäufer": collection["seller"],
+            "Karten-ID": card["card_id"],
+            "Kartenname": card["name"],
+            "Set": card["set_name"],
+            "Kartennummer": card["number"],
+            "Sprache": language_name(
+                card["language"]
+            ),
+            "Zustand (Annahme)": "Near Mint",
+            "Verkäuferland": "Deutschland",
+            "Menge": card["quantity"],
             "Cardvalue Einzelpreis (€)":
                 card["price_cents"] / 100,
-
-            "Gesamtwert (€)":
-                total / 100,
-
+            "Gesamtwert (€)": total / 100,
             "Ankaufsquote (%)":
                 collection["quote_percent"],
-
-            "Ankaufswert (€)":
-                offer / 100,
-
-            "Bildlink":
-                card["image"],
-
-            "Cardmarket Link":
-                cardmarket_link(card),
-
-            "Cardmarket Produkt zugeordnet":
+            "Ankaufswert (€)": offer / 100,
+            "Bildlink": card["image"],
+            "Cardmarket Link": cardmarket_link(card),
+            "Direkte Produktseite": (
                 "Ja"
-                if cardmarket_product_link(card)
+                if cardmarket_filtered_link(card)
                 else "Nein"
+            )
         })
 
     df = pd.DataFrame(rows)
@@ -824,7 +744,7 @@ def create_excel(collection, cards):
             "num_format": '#,##0.00 "€"'
         })
 
-        for column in ["J", "K", "M"]:
+        for column in ("J", "K", "M"):
             sheet.set_column(
                 f"{column}:{column}",
                 22,
@@ -834,9 +754,9 @@ def create_excel(collection, cards):
     return output.getvalue()
 
 
-# =====================================================
+# ============================================================
 # APP STARTEN
-# =====================================================
+# ============================================================
 
 init_db()
 
@@ -855,9 +775,9 @@ tab_dashboard, tab_storage, tab_import = st.tabs([
 ])
 
 
-# =====================================================
+# ============================================================
 # DASHBOARD
-# =====================================================
+# ============================================================
 
 with tab_dashboard:
 
@@ -904,10 +824,10 @@ with tab_dashboard:
         )
 
     st.caption(
-        "Nur gekaufte Sammlungen werden berücksichtigt. "
-        "Die Werte stammen aus den importierten "
-        "Cardvalue.ai-Preisen. Gebühren und Versand "
-        "sind nicht berücksichtigt."
+        "Es werden nur gekaufte Sammlungen "
+        "berücksichtigt. Der Warenwert basiert "
+        "auf den importierten Cardvalue.ai-Preisen. "
+        "Gebühren und Versand sind nicht enthalten."
     )
 
     st.divider()
@@ -941,17 +861,12 @@ with tab_dashboard:
 
                 st.write(
                     "Warenwert:",
-                    euro(
-                        collection["market_cents"]
-                    )
+                    euro(collection["market_cents"])
                 )
 
                 difference = (
                     collection["market_cents"]
-                    - (
-                        collection["purchase_cents"]
-                        or 0
-                    )
+                    - (collection["purchase_cents"] or 0)
                 )
 
                 st.write(
@@ -960,9 +875,9 @@ with tab_dashboard:
                 )
 
 
-# =====================================================
+# ============================================================
 # SAMMLUNGEN
-# =====================================================
+# ============================================================
 
 with tab_storage:
 
@@ -978,11 +893,8 @@ with tab_storage:
     for collection in all_collections:
 
         collection_id = collection["id"]
-
         seller = collection["seller"]
-
         market = collection["market_cents"]
-
         quote_percent = collection["quote_percent"]
 
         suggested = percent_value(
@@ -999,9 +911,7 @@ with tab_storage:
         )
 
         with st.expander(
-            f"{status_text} | "
-            f"{seller} | "
-            f"{euro(market)}"
+            f"{status_text} | {seller} | {euro(market)}"
         ):
 
             st.write(
@@ -1009,18 +919,15 @@ with tab_storage:
             )
 
             st.write(
-                f'**Karten:** '
-                f'{collection["card_count"]}'
+                f'**Karten:** {collection["card_count"]}'
             )
 
             st.write(
-                f"**Sammlungswert:** "
-                f"{euro(market)}"
+                f"**Sammlungswert:** {euro(market)}"
             )
 
             st.write(
-                f"**Ankaufsquote:** "
-                f"{quote_percent} %"
+                f"**Ankaufsquote:** {quote_percent} %"
             )
 
             st.write(
@@ -1036,14 +943,10 @@ with tab_storage:
 
             for card in cards:
 
-                left, right = st.columns(
-                    [1, 4]
-                )
+                left, right = st.columns([1, 4])
 
                 with left:
-
                     if card["image"]:
-
                         st.image(
                             card["image"],
                             width=120
@@ -1061,76 +964,71 @@ with tab_storage:
                     )
 
                     st.write(
-                        f'Sprache: '
-                        f'{language_name(card["language"])}'
+                        "Sprache:",
+                        language_name(
+                            card["language"]
+                        )
                     )
 
                     st.write(
-                        f'Menge: {card["quantity"]}'
+                        "Menge:",
+                        card["quantity"]
                     )
 
                     st.write(
-                        f'Einzelpreis: '
-                        f'{euro(card["price_cents"])}'
+                        "Einzelpreis:",
+                        euro(card["price_cents"])
                     )
 
-                    st.caption(
-                        "Cardmarket-Vorgaben: "
-                        "Verkäufer Deutschland · "
-                        "mindestens Near Mint"
-                    )
-
-                    exact_link = (
-                        cardmarket_product_link(card)
+                    exact_link = cardmarket_filtered_link(
+                        card
                     )
 
                     if exact_link:
 
                         st.link_button(
-                            "🔗 Cardmarket – gefilterte Angebote",
+                            "🔗 Cardmarket – passende Angebote",
                             exact_link
                         )
 
                         st.caption(
-                            "Produktseite hinterlegt. "
-                            "Sprache aus JSON, Deutschland "
-                            "und mindestens NM in der URL."
+                            "Kartensprache automatisch · "
+                            "Verkäufer Deutschland · "
+                            "mindestens Near Mint"
                         )
 
                     else:
 
                         st.link_button(
-                            "🔎 Direkt auf Cardmarket suchen",
+                            "🔎 Karte auf Cardmarket suchen",
                             cardmarket_search_link(card)
                         )
 
                         st.caption(
-                            "Die exakte Produktseite ist "
-                            "noch nicht zugeordnet. "
-                            "Die Angebotsfilter können "
-                            "erst auf der Produktseite "
-                            "zuverlässig angewendet werden."
+                            "Für diese Karte ist noch keine "
+                            "eindeutige Cardmarket-Produktseite "
+                            "hinterlegt."
                         )
 
                     with st.popover(
-                        "⚙️ Cardmarket-Produktlink"
+                        "⚙️ Cardmarket-Produkt zuordnen"
                     ):
 
                         st.write(
-                            "Hier kannst du einmalig die "
-                            "exakte Cardmarket-Produktseite "
-                            "dieser Karte speichern."
+                            "Hier kannst du die exakte "
+                            "Cardmarket-Produktadresse "
+                            "einmalig speichern."
+                        )
+
+                        saved_url = str(
+                            card["cardmarket_url"] or ""
                         )
 
                         url_input = st.text_input(
-                            "Cardmarket-Produkt-URL",
-                            value=(
-                                card["cardmarket_url"]
-                                or ""
-                            ),
+                            "Cardmarket-Produktlink",
+                            value=saved_url,
                             key=(
-                                f"cm_url_"
-                                f"{collection_id}_"
+                                f"cm_url_{collection_id}_"
                                 f"{card['id']}"
                             ),
                             placeholder=(
@@ -1142,8 +1040,7 @@ with tab_storage:
                         if st.button(
                             "Produktlink speichern",
                             key=(
-                                f"cm_save_"
-                                f"{collection_id}_"
+                                f"cm_save_{collection_id}_"
                                 f"{card['id']}"
                             )
                         ):
@@ -1159,10 +1056,7 @@ with tab_storage:
                                 st.rerun()
 
                             except ValueError as error:
-
-                                st.error(
-                                    str(error)
-                                )
+                                st.error(str(error))
 
                 st.divider()
 
@@ -1175,8 +1069,7 @@ with tab_storage:
                 "📥 Excel herunterladen",
                 data=excel,
                 file_name=(
-                    f"sammlung_"
-                    f"{collection_id}_"
+                    f"sammlung_{collection_id}_"
                     f"{safe_filename(seller)}.xlsx"
                 ),
                 mime=(
@@ -1216,8 +1109,7 @@ with tab_storage:
                 ):
 
                     st.warning(
-                        "Diese Sammlung wird "
-                        "dauerhaft gelöscht."
+                        "Die Sammlung wird dauerhaft gelöscht."
                     )
 
                     if st.button(
@@ -1234,15 +1126,14 @@ with tab_storage:
             else:
 
                 st.success(
-                    "Diese Sammlung wurde gekauft "
-                    "und ist im Dashboard enthalten."
+                    "Diese Sammlung ist gekauft "
+                    "und im Dashboard enthalten."
                 )
 
                 st.write(
                     "Tatsächlicher Kaufpreis:",
                     euro(
-                        collection["purchase_cents"]
-                        or 0
+                        collection["purchase_cents"] or 0
                     )
                 )
 
@@ -1251,16 +1142,14 @@ with tab_storage:
                     key=f"undo_{collection_id}"
                 ):
 
-                    undo_purchase(
-                        collection_id
-                    )
+                    undo_purchase(collection_id)
 
                     st.rerun()
 
 
-# =====================================================
+# ============================================================
 # NEUE SAMMLUNG
-# =====================================================
+# ============================================================
 
 with tab_import:
 
@@ -1268,7 +1157,8 @@ with tab_import:
 
     st.write(
         "Lade deine Cardvalue.ai-JSON-Datei hoch. "
-        "Die Kartensprache wird automatisch übernommen."
+        "Kartensprache, Kartennummer, Set, Bilder "
+        "und Preise werden automatisch übernommen."
     )
 
     with st.form("import_form"):
@@ -1338,8 +1228,7 @@ with tab_import:
                 )
 
                 st.write(
-                    f"**Sammlungs-ID:** "
-                    f"{collection_id}"
+                    f"**Sammlungs-ID:** {collection_id}"
                 )
 
                 st.write(
@@ -1352,29 +1241,26 @@ with tab_import:
                 )
 
                 st.info(
-                    "Die Sammlung befindet sich jetzt "
-                    "im Bereich 'Sammlungen'. "
-                    "Erst nach dem Markieren als gekauft "
-                    "wird sie im Dashboard berücksichtigt."
+                    "Die Sammlung liegt jetzt im Bereich "
+                    "'Sammlungen'. Sie wird erst nach dem "
+                    "Markieren als gekauft im Dashboard "
+                    "berücksichtigt."
                 )
 
             except ValueError as error:
-
-                st.error(
-                    str(error)
-                )
+                st.error(str(error))
 
 
-# =====================================================
+# ============================================================
 # FOOTER
-# =====================================================
+# ============================================================
 
 st.divider()
 
 st.caption(
     "Pokémon TCG Manager | "
-    "Cardvalue.ai JSON-Import · "
+    "Cardvalue.ai Import · "
     "Sammlungsverwaltung · "
-    "Cardmarket-Verlinkung · "
+    "Cardmarket · "
     "Excel-Export"
 )
